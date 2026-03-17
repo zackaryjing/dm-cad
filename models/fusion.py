@@ -10,33 +10,25 @@ import torch.nn as nn
 class ModalFusion(nn.Module):
     """双模态融合模块
 
-    支持三种融合方式:
-    - concat: 拼接后投影
-    - cross_attention: 交叉注意力 (推荐)
-    - gating: 门控机制
+    使用门控 (Gating) 机制实现"图像为主，文本为辅"的融合策略:
+    - 计算权重 α = σ(Linear([z_img; z_txt]))
+    - 融合特征 z_fused = α · z_img + (1 - α) · z_txt
+    - 图像为主：给 z_img 设置较高的基础权重
     """
-    def __init__(self, embed_dim=512, fusion_type='cross_attention'):
+    def __init__(self, embed_dim=512, fusion_type='gating', img_bias=0.7):
         super().__init__()
         self.fusion_type = fusion_type
+        self.img_bias = img_bias  # 图像基础权重偏置
 
-        if fusion_type == 'concat':
-            self.fusion = nn.Sequential(
-                nn.Linear(embed_dim * 2, embed_dim),
-                nn.LayerNorm(embed_dim),
-                nn.GELU()
-            )
-        elif fusion_type == 'cross_attention':
-            # 文本作为 query，图像作为 key/value
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=embed_dim,
-                num_heads=8,
-                batch_first=True
-            )
-            self.norm = nn.LayerNorm(embed_dim)
-        elif fusion_type == 'gating':
-            self.gate_proj = nn.Linear(embed_dim * 2, embed_dim)
-        else:
-            raise ValueError(f"Unknown fusion type: {fusion_type}")
+        # 门控投影：拼接后投影到 1 维得到 α
+        self.gate_proj = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, 1)
+        )
+
+        # 可选的残差连接
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, z_img, z_txt):
         """
@@ -46,23 +38,21 @@ class ModalFusion(nn.Module):
         Returns:
             z_fused: [batch, embed_dim] - 融合后的特征
         """
-        if self.fusion_type == 'concat':
-            fused = torch.cat([z_img, z_txt], dim=-1)
-            return self.fusion(fused)
+        # 拼接两个模态
+        concat = torch.cat([z_img, z_txt], dim=-1)  # [batch, 2*embed_dim]
 
-        elif self.fusion_type == 'cross_attention':
-            # 添加 sequence 维度
-            z_txt_q = z_txt.unsqueeze(1)  # [batch, 1, embed_dim]
-            z_img_kv = z_img.unsqueeze(1)  # [batch, 1, embed_dim]
+        # 计算门控权重 α (0 到 1 之间)
+        alpha = torch.sigmoid(self.gate_proj(concat))  # [batch, 1]
 
-            attn_out, _ = self.cross_attn(
-                query=z_txt_q,
-                key=z_img_kv,
-                value=z_img_kv
-            )
-            return self.norm(attn_out.squeeze(1))
+        # 应用图像偏置 - 确保图像为主
+        # alpha_adj = alpha * (1 - img_bias) + img_bias
+        # 这样 α 的范围是 [img_bias, 1]，图像始终占主导
+        alpha_adj = alpha * (1 - self.img_bias) + self.img_bias
 
-        elif self.fusion_type == 'gating':
-            concat = torch.cat([z_img, z_txt], dim=-1)
-            gate = torch.sigmoid(self.gate_proj(concat))
-            return gate * z_img + (1 - gate) * z_txt
+        # 门控融合：z_fused = α · z_img + (1 - α) · z_txt
+        z_fused = alpha_adj * z_img + (1 - alpha_adj) * z_txt
+
+        # 残差连接 + 归一化
+        z_fused = self.norm(z_fused + z_img)
+
+        return z_fused

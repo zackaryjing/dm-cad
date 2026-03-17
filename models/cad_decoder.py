@@ -1,6 +1,9 @@
 """
 CAD 序列解码器模块 - 实现 CAD 命令序列生成
 基于设计文档 3.5 节和 DeepCAD 架构
+
+优化：
+- 每层 TransformerDecoder 都进行 Memory Cross-Attention，增强长序列记忆
 """
 
 import torch
@@ -11,22 +14,23 @@ class CADDecoder(nn.Module):
     """基于 DeepCAD 的 CAD 序列解码器
 
     将融合特征解码为 CAD 命令序列 (sketch + extrusion 操作)
+    每层都进行 Memory Cross-Attention，确保层层感知条件信息
     """
     def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=120):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.embed_dim = embed_dim
 
-        # CAD 命令嵌入 (3 种类型：START, SKETCH, EXTRUDE, END)
+        # CAD 命令嵌入 (4 种类型：START, SKETCH, EXTRUDE, END)
         self.cmd_embed = nn.Embedding(num_embeddings=4, embedding_dim=embed_dim)
 
-        # 参数嵌入 (19 维参数向量)
-        self.param_embed = nn.Linear(19, embed_dim)
+        # 参数嵌入 (20 维参数向量，适配数据加载器的 padding)
+        self.param_embed = nn.Linear(20, embed_dim)
 
         # 位置编码
         self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))
 
-        # Transformer Decoder
+        # Transformer Decoder - 每层都会使用 memory 进行交叉注意力
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
             nhead=n_heads,
@@ -41,7 +45,7 @@ class CADDecoder(nn.Module):
         self.param_head = nn.Sequential(
             nn.Linear(embed_dim, 512),
             nn.ReLU(),
-            nn.Linear(512, 19)
+            nn.Linear(512, 20)
         )
 
     def forward(self, z_fused, tgt_seq=None, training=True):
@@ -51,25 +55,27 @@ class CADDecoder(nn.Module):
             tgt_seq: 目标 CAD 序列 (training 时使用) [batch, seq_len, 20]
         Returns:
             cmd_logits: [batch, seq_len, 4] - 命令类型预测
-            param_pred: [batch, seq_len, 19] - 参数预测
+            param_pred: [batch, seq_len, 20] - 参数预测
         """
         B = z_fused.shape[0]
 
         # 准备 decoder 输入
         if training and tgt_seq is not None:
-            # Teacher forcing
+            # Teacher forcing - 使用完整目标序列
             tgt_embed = self._embed_sequence(tgt_seq)
+            seq_len = tgt_embed.shape[1]
         else:
-            # 自回归生成
+            # 自回归生成 - 从 START token 开始
             tgt_embed = self.cmd_embed(torch.zeros(B, 1, dtype=torch.long).to(z_fused.device))
+            seq_len = 1
 
         # 添加位置编码
-        tgt_embed = tgt_embed + self.pos_embed[:, :tgt_embed.shape[1], :]
+        tgt_embed = tgt_embed + self.pos_embed[:, :seq_len, :]
 
-        # memory = 条件向量
+        # memory = 条件向量 (每层都会进行交叉注意力)
         memory = z_fused.unsqueeze(1)  # [batch, 1, embed_dim]
 
-        # Transformer 解码
+        # Transformer 解码 - 每一层都使用 memory 进行交叉注意力
         output = self.transformer_decoder(tgt_embed, memory=memory)
 
         # 输出预测
@@ -85,7 +91,7 @@ class CADDecoder(nn.Module):
                  命令类型：0=START, 1=SKETCH, 2=EXTRUDE, 3=END
         """
         cmd_types = seq[:, :, 0].long().clamp(0, 3)  # 限制命令类型在有效范围内
-        params = seq[:, :, 1:]
+        params = seq[:, :, :]  # 使用全部 20 维
 
         cmd_emb = self.cmd_embed(cmd_types)
         param_emb = self.param_embed(params)
@@ -112,8 +118,9 @@ class CADDecoder(nn.Module):
 
         for step in range(max_steps):
             current_input = current_input + self.pos_embed[:, step:step+1, :]
-            memory = z_fused.unsqueeze(1)
+            memory = z_fused.unsqueeze(1)  # [batch, 1, embed_dim]
 
+            # Transformer 解码 - 每一层都使用 memory 进行交叉注意力
             output = self.transformer_decoder(current_input, memory=memory)
 
             cmd_logits = self.cmd_head(output[:, -1:, :])

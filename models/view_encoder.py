@@ -39,17 +39,24 @@ class ViewEncoder(nn.Module):
 
 class MultiViewFusion(nn.Module):
     """多视图注意力池化模块
-    使用 Transformer encoder 进行视图间注意力融合
+
+    使用 CLS Token 模式进行空间加权聚合:
+    - 在 8 个视图特征前插入可学习 [CLS] 向量
+    - [CLS] 通过自注意力主动吸纳 8 个角度中最重要的几何特征
+    - 最终取 encoded[:, 0] 作为 z_img
     """
     def __init__(self, embed_dim=512, n_views=8, n_heads=8):
         super().__init__()
         self.n_views = n_views
         self.embed_dim = embed_dim
 
-        # 视图位置编码
+        # 可学习的 [CLS] token - 用于聚合全局特征
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+
+        # 视图位置编码 (8 个固定视角)
         self.view_pos_embed = nn.Parameter(torch.randn(1, n_views, embed_dim))
 
-        # 使用symotion-prefix)   Transformer encoder 进行视图间注意力
+        # Transformer encoder 进行视图间注意力
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=n_heads,
@@ -67,17 +74,23 @@ class MultiViewFusion(nn.Module):
         Args:
             view_features: [batch, n_views, embed_dim] - 各视图特征
         Returns:
-            fused: [batch, embed_dim] - 融合后的特征
+            fused: [batch, embed_dim] - 融合后的特征 (通过 [CLS] 聚合)
         """
-        B, N, D = view_features.shape
+        B = view_features.shape[0]
 
-        # 添加位置编码
+        # 扩展 [CLS] token 到 batch 大小
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # [batch, 1, embed_dim]
+
+        # 添加位置编码到视图特征
         view_features = view_features + self.view_pos_embed.expand(B, -1, -1)
 
-        # Transformer 编码
-        encoded = self.transformer(view_features)  # [batch, n_views, embed_dim]
+        # 拼接 [CLS] + 8 个视图特征
+        transformer_input = torch.cat([cls_tokens, view_features], dim=1)  # [batch, 9, embed_dim]
 
-        # 全局平均池化
-        fused = encoded.mean(dim=1)  # [batch, embed_dim]
+        # Transformer 编码 - [CLS] 通过自注意力吸收各视图信息
+        encoded = self.transformer(transformer_input)  # [batch, 9, embed_dim]
+
+        # 取 [CLS] 位置的特征作为融合结果 (encoded[:, 0])
+        fused = encoded[:, 0]  # [batch, embed_dim]
 
         return self.aggregate(fused)
