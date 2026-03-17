@@ -465,15 +465,15 @@ class ModalFusion(nn.Module):
 ```python
 class CADDecoder(nn.Module):
     """基于 DeepCAD 的 CAD 序列解码器"""
-    def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=20):
+    def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=120):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.embed_dim = embed_dim
-        
+
         # CAD 命令嵌入
         self.cmd_embed = nn.Embedding(num_embeddings=3, embedding_dim=embed_dim)
         self.param_embed = nn.Linear(19, embed_dim)
-        
+
         # 位置编码
         self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))
         
@@ -984,7 +984,7 @@ model:
   embed_dim: 512
   n_heads: 8
   n_layers: 6
-  max_seq_len: 20
+  max_seq_len: 120
   n_views: 8
 
 training:

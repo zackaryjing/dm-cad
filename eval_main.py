@@ -3,7 +3,7 @@
 评估入口脚本
 
 用法:
-    python eval_main.py --checkpoint checkpoints/best.pth --data_dir ./data/test
+    python eval_main.py --checkpoint checkpoints/best.pth --data_dir datasets/dataset_v0
 """
 
 import argparse
@@ -17,8 +17,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate Dual-Modal CAD Generator')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Path to test data directory')
+    parser.add_argument('--data_dir', type=str, default='datasets/dataset_v0',
+                        help='Path to data directory (default: datasets/dataset_v0)')
+    parser.add_argument('--split', type=str, default='test',
+                        help='Dataset split to evaluate (default: test)')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
     parser.add_argument('--device', type=str, default='cuda',
@@ -46,13 +48,14 @@ def main():
     model.to(device)
 
     # 构建数据加载器
-    print(f'Loading test data from {args.data_dir}...')
+    print(f'Loading {args.split} data from {args.data_dir}...')
     test_loader = build_dataloader(
-        args.data_dir,
-        split='test',
+        data_root=args.data_dir,
+        split=args.split,
         batch_size=args.batch_size,
         num_workers=4
     )
+    print(f'  Loaded {len(test_loader.dataset)} samples')
 
     # 创建评估器
     evaluator = Evaluator(model, device=device)

@@ -12,7 +12,7 @@ class CADDecoder(nn.Module):
 
     将融合特征解码为 CAD 命令序列 (sketch + extrusion 操作)
     """
-    def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=20):
+    def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=120):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.embed_dim = embed_dim
@@ -92,7 +92,7 @@ class CADDecoder(nn.Module):
 
         return cmd_emb + param_emb
 
-    def generate(self, z_fused, max_steps=20):
+    def generate(self, z_fused, max_steps=120):
         """自回归生成 CAD 序列
 
         Args:

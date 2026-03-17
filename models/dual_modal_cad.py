@@ -39,7 +39,7 @@ class DualModalCADGenerator(nn.Module):
             'embed_dim': 512,
             'n_heads': 8,
             'n_layers': 6,
-            'max_seq_len': 20,
+            'max_seq_len': 120,
             'n_views': 8
         }
 
@@ -73,7 +73,7 @@ class DualModalCADGenerator(nn.Module):
 
         return cmd_logits, param_pred
 
-    def generate(self, images, text_input_ids, text_attention_mask, max_steps=20):
+    def generate(self, images, text_input_ids, text_attention_mask, max_steps=120):
         """推理模式 - 生成 CAD 序列
 
         Args:

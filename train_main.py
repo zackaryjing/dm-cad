@@ -3,7 +3,7 @@
 训练入口脚本
 
 用法:
-    python train_main.py --config train/config.yaml
+    python train_main.py --config train/config.yaml --data_dir datasets/dataset_v0
 """
 
 import argparse
@@ -17,8 +17,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train Dual-Modal CAD Generator')
     parser.add_argument('--config', type=str, default='train/config.yaml',
                         help='Path to config file')
-    parser.add_argument('--data_dir', type=str, default='./data',
-                        help='Path to data directory')
+    parser.add_argument('--data_dir', type=str, default='datasets/dataset_v0',
+                        help='Path to data directory (default: datasets/dataset_v0)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--device', type=str, default='cuda',
@@ -32,10 +32,6 @@ def main():
     # 加载配置
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-
-    # 更新数据路径
-    config['data']['train_data_dir'] = args.data_dir
-    config['data']['val_data_dir'] = args.data_dir
 
     # 设置设备
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -52,21 +48,23 @@ def main():
         trainer.load_checkpoint(args.resume)
 
     # 构建数据加载器
-    print('Loading training data...')
+    print(f'Loading training data from {args.data_dir}...')
     train_loader = build_dataloader(
-        config['data']['train_data_dir'],
+        data_root=args.data_dir,
         split='train',
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers']
     )
+    print(f'  Loaded {len(train_loader.dataset)} samples')
 
-    print('Loading validation data...')
+    print(f'Loading validation data from {args.data_dir}...')
     val_loader = build_dataloader(
-        config['data']['val_data_dir'],
-        split='val',
+        data_root=args.data_dir,
+        split='test',  # 使用 test 集作为验证集
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers']
     )
+    print(f'  Loaded {len(val_loader.dataset)} samples')
 
     # 开始训练
     print(f'Starting training for {config["training"]["num_epochs"]} epochs...')

@@ -6,18 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Install dependencies (conda recommended)
-conda create -n dmcad python=3.10
-conda activate dmcad
+conda create -n deepcad38 python=3.8
+conda activate deepcad38
 pip install -r requirements.txt
 
+# Dataset partition (generate train/test split)
+python data/partition_dataset.py --data_dir datasets/dataset_v0 --train_ratio 0.8 --seed 42 --workers 8
+
 # Training
-python train_main.py --config train/config.yaml --data_dir ./data
+python train_main.py --config train/config.yaml --data_dir datasets/dataset_v0
 
 # Resume from checkpoint
-python train_main.py --config train/config.yaml --data_dir ./data --resume checkpoints/epoch_10.pth
+python train_main.py --config train/config.yaml --data_dir datasets/dataset_v0 --resume checkpoints/epoch_10.pth
 
 # Evaluation
-python eval_main.py --checkpoint checkpoints/best.pth --data_dir ./data/test
+python eval_main.py --checkpoint checkpoints/best.pth --data_dir datasets/dataset_v0 --split test
 
 # Inference (requires 8 view images)
 python infer.py --checkpoint checkpoints/best.pth --images view_00.png ... view_07.png --text "description"
@@ -45,15 +48,18 @@ DualModalCADGenerator
 
 ### Data Pipeline (`data/`)
 
-- `CADDataset` loads triples: (8-view images, text, CAD sequence)
+- `CADDataset` loads triples: (8-view images, text description, CAD vector)
 - Data format expected:
   ```
-  data/
-  ├── train.json / val.json / test.json  # lists of {uid, text, ...}
-  ├── images/<uid>/view_{00-07}.png
-  └── cad_seq/<uid>.pt
+  datasets/dataset_v0/
+  ├── train_ids.txt / test_ids.txt  # sample IDs for train/test split
+  ├── cad_desc/<group_id>.json      # text descriptions ({id, text caption})
+  ├── cad_img/<group_id>/<sample_id>/{sample_id}_{000-007}.png
+  └── cad_vec/<group_id>/<sample_id>.h5
   ```
+- CAD vectors are loaded from h5 files (`vec` dataset, shape [seq_len, 17])
 - CAD sequences use DeepCAD format: START → [SKETCH, EXTRUDE]* → END
+- Data partition script: `python data/partition_dataset.py --data_dir datasets/dataset_v0`
 
 ### Training (`train/`)
 
@@ -67,7 +73,7 @@ DualModalCADGenerator
 All hyperparameters in `train/config.yaml`. Key defaults:
 - embed_dim: 512, n_heads: 8, n_layers: 6
 - batch_size: 32, epochs: 80, lr: 5e-5
-- 8 views, max_seq_len: 20
+- 8 views, max_seq_len: 120
 
 ## Key Design References
 
