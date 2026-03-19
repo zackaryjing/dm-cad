@@ -1,29 +1,64 @@
 """
 损失函数模块 - 实现 CAD 序列生成损失
 基于设计文档 4.1 节
+
+改进：根据命令类型，只对"有效参数维度"计算 Loss
 """
 
 import torch
 import torch.nn as nn
 
 
+# 命令类型常量（适配当前项目简化版：4 种命令类型）
+# 项目实际使用：START=0, SKETCH=1, EXTRUDE=2, END=3
+# 但数据加载器加载的 DeepCAD 原始数据使用 6 种命令：
+#   Line=0, Arc=1, Circle=2, EOS=3, SOL=4, Ext=5
+
+# 参数维度说明（19 维参数，索引 0-18）：
+#   [0:5] = Sketch 参数：x, y, alpha, f, r
+#           对应 DeepCAD: x, y (终点), alpha (扫角), f (clock_sign), r (半径)
+#   [5:19] = Extrude 参数 (11 维)：
+#           theta, phi, gamma (挤压平面方向)
+#           p_x, p_y, p_z, s (挤压位置 + 尺寸)
+#           e1, e2, b, u, ... (挤压距离 + 操作类型 + 类型)
+
+# 命令 - 参数有效性掩码 (19 维参数)
+# 每个命令只在其有效参数维度上计算 loss，避免无效梯度噪声
+# 基于 DeepCAD 原始 6 种命令类型
+CMD_PARAM_MASK = torch.tensor([
+    # 0   1   2   3   4   | 5   6   7   8   9   10  11  12  13  14  15  16  17  18
+    [1,  1,  0,  0,  0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],  # Line(0): x, y (终点坐标)
+    [1,  1,  1,  1,  0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],  # Arc(1): x, y, alpha (扫角), f (方向)
+    [1,  1,  0,  0,  1,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],  # Circle(2): x, y (圆心), r (半径)
+    [0,  0,  0,  0,  0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],  # EOS(3): 无参数
+    [0,  0,  0,  0,  0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],  # SOL(4): 无参数
+    [0,  0,  0,  0,  0,   1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  0,  0,  0],  # Ext(5): 11 维挤压参数
+])
+
+
 class CADLoss(nn.Module):
     """CAD 序列生成损失函数
 
     包含命令类型损失和参数预测损失
+    改进：只对命令的有效参数维度计算损失
     """
-    def __init__(self, cmd_weight=1.0, param_weight=0.5):
+    def __init__(self, cmd_weight=1.0, param_weight=0.5, use_cmd_mask=True):
         """
         Args:
             cmd_weight: 命令损失权重
             param_weight: 参数损失权重
+            use_cmd_mask: 是否使用命令类型掩码（只对有效参数计算损失）
         """
         super().__init__()
         self.cmd_weight = cmd_weight
         self.param_weight = param_weight
+        self.use_cmd_mask = use_cmd_mask
 
         self.cmd_criterion = nn.CrossEntropyLoss()
         self.param_criterion = nn.SmoothL1Loss()
+
+        # 注册命令 - 参数掩码（buffer 不计算梯度）
+        self.register_buffer('cmd_param_mask', CMD_PARAM_MASK)
 
     def forward(self, cmd_logits, param_pred, cmd_gt, param_gt, valid_mask):
         """
@@ -37,18 +72,37 @@ class CADLoss(nn.Module):
             total_loss: 总损失
             loss_dict: 各分项损失字典
         """
+        batch, seq_len, n_params = param_pred.shape
+
         # 命令损失
         cmd_loss = self.cmd_criterion(
             cmd_logits.view(-1, cmd_logits.shape[-1]),
             cmd_gt.view(-1)
         )
 
-        # 参数损失 (仅对有效命令计算)
+        # 参数损失 - 改进版本：只对有效参数维度计算损失
         if valid_mask.sum() > 0:
-            param_loss = self.param_criterion(
-                param_pred[valid_mask],
-                param_gt[valid_mask]
-            )
+            if self.use_cmd_mask:
+                # 获取每个位置的命令类型掩码 [batch, seq_len, n_params]
+                cmd_mask = self.cmd_param_mask[cmd_gt]  # [B, T, 19]
+
+                # 结合有效掩码和命令掩码
+                combined_mask = valid_mask.unsqueeze(-1) & (cmd_mask == 1)
+
+                # 只计算有效位置的损失
+                if combined_mask.sum() > 0:
+                    param_loss = self.param_criterion(
+                        param_pred[combined_mask],
+                        param_gt[combined_mask]
+                    )
+                else:
+                    param_loss = torch.tensor(0.0, device=param_pred.device)
+            else:
+                # 原始版本：对所有参数计算损失
+                param_loss = self.param_criterion(
+                    param_pred[valid_mask],
+                    param_gt[valid_mask]
+                )
         else:
             param_loss = torch.tensor(0.0, device=param_pred.device)
 
