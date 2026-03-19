@@ -49,21 +49,29 @@ def main():
 
     # 构建数据加载器
     print(f'Loading training data from {args.data_dir}...')
+    train_ids_file = config.get('data', {}).get('train_ids_file')
     train_loader = build_dataloader(
         data_root=args.data_dir,
         split='train',
         batch_size=config['training']['batch_size'],
-        num_workers=config['training']['num_workers']
+        num_workers=config['training']['num_workers'],
+        ids_file=train_ids_file
     )
+    if train_ids_file:
+        print(f'  Using ids file: {train_ids_file}')
     print(f'  Loaded {len(train_loader.dataset)} samples')
 
     print(f'Loading validation data from {args.data_dir}...')
+    test_ids_file = config.get('data', {}).get('test_ids_file')
     val_loader = build_dataloader(
         data_root=args.data_dir,
         split='test',  # 使用 test 集作为验证集
         batch_size=config['training']['batch_size'],
-        num_workers=config['training']['num_workers']
+        num_workers=config['training']['num_workers'],
+        ids_file=test_ids_file
     )
+    if test_ids_file:
+        print(f'  Using ids file: {test_ids_file}')
     print(f'  Loaded {len(val_loader.dataset)} samples')
 
     # 开始训练

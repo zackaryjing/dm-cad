@@ -4,9 +4,11 @@
 
 用法:
     python eval_main.py --checkpoint checkpoints/best.pth --data_dir datasets/dataset_v0
+    python eval_main.py --checkpoint checkpoints/best.pth --config train/config.yaml --data_dir datasets/dataset_v0
 """
 
 import argparse
+import yaml
 import torch
 from models.dual_modal_cad import DualModalCADGenerator
 from eval.evaluate import Evaluator
@@ -17,6 +19,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate Dual-Modal CAD Generator')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to config file (optional, for ids_file setting)')
     parser.add_argument('--data_dir', type=str, default='datasets/dataset_v0',
                         help='Path to data directory (default: datasets/dataset_v0)')
     parser.add_argument('--split', type=str, default='test',
@@ -32,6 +36,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # 加载配置（如果提供）
+    config = {}
+    if args.config:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+        print(f'Loaded config from {args.config}')
 
     # 设置设备
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -49,12 +60,17 @@ def main():
 
     # 构建数据加载器
     print(f'Loading {args.split} data from {args.data_dir}...')
+    # 优先使用 config 中的 ids_file 配置
+    test_ids_file = config.get('data', {}).get('test_ids_file')
     test_loader = build_dataloader(
         data_root=args.data_dir,
         split=args.split,
         batch_size=args.batch_size,
-        num_workers=4
+        num_workers=4,
+        ids_file=test_ids_file
     )
+    if test_ids_file:
+        print(f'  Using ids file: {test_ids_file}')
     print(f'  Loaded {len(test_loader.dataset)} samples')
 
     # 创建评估器
