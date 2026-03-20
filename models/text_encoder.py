@@ -17,14 +17,13 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.bert = AutoModel.from_pretrained(pretrained_bert)
 
-        # 冻结 BERT 参数 (可选部分微调)
         for param in self.bert.parameters():
             param.requires_grad = False
 
-        # 适配层：768 -> 512
+        hidden_size = self.bert.config.hidden_size
         self.adapt = nn.Sequential(
-            nn.Linear(768, 512),
-            nn.LayerNorm(512),
+            nn.Linear(hidden_size, embed_dim),
+            nn.LayerNorm(embed_dim),
             nn.GELU(),
             nn.Dropout(0.1)
         )
@@ -35,16 +34,11 @@ class TextEncoder(nn.Module):
             input_ids: [batch, seq_len] - BERT 输入 token IDs
             attention_mask: [batch, seq_len] - 注意力掩码
         Returns:
-            z_txt: [batch, 512] - 文本编码特征
+            z_txt: [batch, embed_dim] - 文本编码特征
         """
-        # BERT 编码
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-
-        # 使用 [CLS] token 作为句子表示
-        cls_embedding = outputs.last_hidden_state[:, 0, :]  # [batch, 768]
-
-        # 投影到 CAD latent 空间
-        return self.adapt(cls_embedding)  # [batch, 512]
+        cls_embedding = outputs.last_hidden_state[:, 0, :]
+        return self.adapt(cls_embedding)
 
     def unfreeze_bert(self):
         """解冻 BERT 参数进行微调"""

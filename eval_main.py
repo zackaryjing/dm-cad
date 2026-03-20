@@ -3,16 +3,18 @@
 评估入口脚本
 
 用法:
-    python eval_main.py --checkpoint checkpoints/best.pth --data_dir datasets/dataset_v0
-    python eval_main.py --checkpoint checkpoints/best.pth --config train/config.yaml --data_dir datasets/dataset_v0
+    python eval_main.py --checkpoint checkpoints/best.pth
+    python eval_main.py --checkpoint checkpoints/best.pth --config train/config.yaml
 """
 
 import argparse
-import yaml
+
 import torch
-from models.dual_modal_cad import DualModalCADGenerator
-from eval.evaluate import Evaluator
+import yaml
+
 from data.dataset import build_dataloader
+from eval.evaluate import Evaluator
+from models.dual_modal_cad import DualModalCADGenerator
 
 
 def parse_args():
@@ -20,13 +22,15 @@ def parse_args():
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default=None,
-                        help='Path to config file (optional, for ids_file setting)')
-    parser.add_argument('--data_dir', type=str, default='datasets/dataset_v0',
-                        help='Path to data directory (default: datasets/dataset_v0)')
+                        help='Path to config file (optional, for dataloader settings)')
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help='Path to data directory (default: from config or datasets/dataset_v1)')
     parser.add_argument('--split', type=str, default='test',
                         help='Dataset split to evaluate (default: test)')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size for evaluation')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Batch size for evaluation (default: from config or 32)')
+    parser.add_argument('--max_batches', type=int, default=None,
+                        help='Maximum number of evaluation batches (default: from config or all)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use for evaluation')
     parser.add_argument('--output', type=str, default=None,
@@ -37,58 +41,64 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 加载配置（如果提供）
     config = {}
     if args.config:
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
         print(f'Loaded config from {args.config}')
 
-    # 设置设备
+    data_cfg = config.get('data', {})
+    training_cfg = config.get('training', {})
+
     if args.device == 'cuda' and not torch.cuda.is_available():
         print('CUDA not available, using CPU')
         device = 'cpu'
     else:
         device = args.device
 
-    # 加载模型
     print(f'Loading model from {args.checkpoint}...')
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    model = DualModalCADGenerator(checkpoint.get('config', {}))
+    model_config = checkpoint.get('config', {}).get('model', checkpoint.get('config', {}))
+    model = DualModalCADGenerator(model_config)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
+    model.eval()
 
-    # 构建数据加载器
-    print(f'Loading {args.split} data from {args.data_dir}...')
-    # 优先使用 config 中的 ids_file 配置
-    test_ids_file = config.get('data', {}).get('test_ids_file')
+    data_root = args.data_dir or data_cfg.get('data_root', 'datasets/dataset_v1')
+    batch_size = args.batch_size or training_cfg.get('batch_size', 32)
+    max_batches = args.max_batches or training_cfg.get('max_val_batches')
+    ids_file = data_cfg.get(f'{args.split}_ids_file')
+    if ids_file is None and args.split == 'test':
+        ids_file = data_cfg.get('test_ids_file')
+
+    print(f'Loading {args.split} data from {data_root}...')
     test_loader = build_dataloader(
-        data_root=args.data_dir,
+        data_root=data_root,
         split=args.split,
-        batch_size=args.batch_size,
-        num_workers=4,
-        ids_file=test_ids_file
+        batch_size=batch_size,
+        num_workers=training_cfg.get('num_workers', 4),
+        ids_file=ids_file,
+        img_size=data_cfg.get('img_size', 224),
+        text_max_len=data_cfg.get('text_max_len', 64),
     )
-    if test_ids_file:
-        print(f'  Using ids file: {test_ids_file}')
+    if ids_file:
+        print(f'  Using ids file: {ids_file}')
     print(f'  Loaded {len(test_loader.dataset)} samples')
+    if max_batches:
+        print(f'  Limiting evaluation to {max_batches} batches')
 
-    # 创建评估器
     evaluator = Evaluator(model, device=device)
 
-    # 评估
     print('Evaluating...')
-    metrics = evaluator.evaluate(test_loader)
+    metrics = evaluator.evaluate(test_loader, max_batches=max_batches)
 
-    # 打印结果
     print('\n=== Evaluation Results ===')
     for name, value in metrics.items():
         print(f'{name}: {value:.4f}')
 
-    # 保存生成结果
     if args.output:
         print(f'Saving generated sequences to {args.output}...')
-        evaluator.generate_and_save(test_loader, args.output)
+        evaluator.generate_and_save(test_loader, args.output, max_batches=max_batches)
 
     print('Evaluation completed!')
 

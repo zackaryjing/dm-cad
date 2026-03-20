@@ -1,0 +1,211 @@
+# CODEX Session Notes
+
+## Scope
+This file summarizes the issues found and fixes made during the Codex session on 2026-03-20.
+
+## Major Issues Found
+
+### 1. Decoder training and generation were inconsistent
+Files: `models/cad_decoder.py`, `models/dual_modal_cad.py`
+
+Problems:
+- Training used the full target sequence directly instead of standard teacher forcing.
+- No causal mask was applied in the decoder, so tokens could attend to future tokens.
+- Autoregressive generation only fed the most recent token, not the full prefix.
+- Validation in `eval()` mode produced only a single decoding step even when a full target sequence was provided.
+
+Fixes:
+- Added right-shifted teacher forcing input.
+- Added decoder causal mask.
+- Reworked generation to decode from the full generated prefix.
+- Changed decoder forward logic so `tgt_seq` always triggers full-sequence decoding, regardless of `model.training`.
+
+### 2. Loss computation incorrectly included padding / invalid samples
+Files: `train/loss.py`, `data/dataset.py`
+
+Problems:
+- Command cross-entropy was computed on all positions, including padding.
+- Missing CAD vector files returned a zero-filled fake sequence and were treated as valid data.
+- Padding used command `0`, which biased the model toward `Line`.
+- CUDA training exposed a device mismatch because the command-parameter mask buffer stayed on CPU.
+
+Fixes:
+- Switched command loss to `reduction='none'` and masked it with `valid_mask`.
+- Kept parameter loss masked by both `valid_mask` and command-specific parameter masks.
+- Missing CAD data now returns an empty sequence plus an empty valid mask.
+- Padding now uses command `-1` and `valid_mask=False`.
+- Moved command-parameter mask to the target device before indexing.
+
+### 3. Evaluation pipeline was invalid
+Files: `eval/evaluate.py`, `eval/metrics.py`, `eval_main.py`
+
+Problems:
+- Evaluation called the model without `tgt_seq`, so it produced one decoding step, then compared that to full ground truth.
+- Generated sequences of different lengths were concatenated across batches, causing runtime errors.
+- `generate_and_save()` used `batch['uids']`, but the dataloader returns `sample_ids`.
+- Parameter accuracy did not respect command-specific valid parameter dimensions.
+
+Fixes:
+- Evaluation now uses `model.generate()` and pads/truncates per batch to GT length.
+- Metric accumulation is done batch-by-batch instead of concatenating incompatible time dimensions.
+- `generate_and_save()` now uses `sample_ids` and writes per-sample command lists.
+- Parameter accuracy now uses the same command-specific mask logic as training.
+- `eval_main.py` now supports `--max_batches` and also reads bounded validation settings from config.
+
+### 4. Config wiring was largely ineffective
+Files: `models/dual_modal_cad.py`, `models/view_encoder.py`, `models/text_encoder.py`, `models/fusion.py`
+
+Problems:
+- Model config values were accepted but mostly ignored.
+- `embed_dim`, `n_heads`, `n_layers`, `max_seq_len`, and `fusion_type` did not fully propagate.
+
+Fixes:
+- Wired config values into the full model construction path.
+- Updated image and text projection layers to respect `embed_dim`.
+- Added actual behavior branches for `fusion_type` (`gating`, `concat`, `cross_attention`).
+- Centralized modality encoding in `DualModalCADGenerator`.
+
+### 5. Inference script used the wrong command protocol
+File: `infer.py`
+
+Problems:
+- Inference still printed old 4-command labels instead of the 6-command DeepCAD protocol.
+- It also assumed the old generation return structure.
+
+Fixes:
+- Updated inference to use the corrected `generate()` API.
+- Switched displayed labels to `Line`, `Arc`, `Circle`, `EOS`, `SOL`, `Ext`.
+- Added a hard check for exactly 8 views.
+
+### 6. Short-baseline support was missing
+Files: `train/train.py`, `eval/evaluate.py`, `eval_main.py`, `train/config_5k_short.yaml`
+
+Problems:
+- A full 5k epoch on the local WSL + RTX 3050 Ti setup was too slow to be practical.
+- There was no built-in way to run a bounded short baseline on the full dataset split.
+
+Fixes:
+- Added optional `training.max_train_batches` and `training.max_val_batches`.
+- Added bounded evaluation support via `eval_main.py --max_batches` and matching evaluator support.
+- Added `train/config_5k_short.yaml` as a reusable short-baseline config.
+
+## New Files Added
+
+### `scripts/run_regression_smoke.sh`
+Purpose:
+- Recreates the minimal smoke regression using a small temporary subset from `dataset_v1`.
+- Runs both `train_main.py` and `eval_main.py`.
+
+Defaults:
+- `TRAIN_SAMPLES=32`
+- `TEST_SAMPLES=8`
+- `DEVICE=cuda`
+- `PYTHON_BIN=/home/jing/allprojects/pythonenvironment/dmcad/bin/python`
+
+### `scripts/run_5k_short_baseline.sh`
+Purpose:
+- Runs the bounded short-baseline config on the full `dataset_v1` split.
+- Uses `train/config_5k_short.yaml` and then evaluates the produced checkpoint.
+
+### `train/config_5k_short.yaml`
+Purpose:
+- Reusable short-baseline config for the full 5k split.
+
+Current values at the end of this session:
+- `batch_size: 4`
+- `num_epochs: 1`
+- `max_train_batches: 100` was attempted during development, then shortened locally due WSL speed constraints; verify before server runs.
+- `max_val_batches` support is available.
+
+Note:
+- Before running on a real server, review the final values in this file and set the desired bounded schedule explicitly.
+
+## Validation Performed
+
+### Static checks
+Used:
+- `/home/jing/allprojects/pythonenvironment/dmcad/bin/python -m py_compile ...`
+
+Result:
+- Passed for the updated training, evaluation, inference, and model files.
+
+### Unit / smoke checks
+Verified locally with small in-process tests:
+- Decoder training output shapes.
+- Decoder generation output contract.
+- Loss masking behavior.
+- Metrics return schema.
+- Eval-mode teacher forcing shape handling.
+- CUDA loss path after device-fix.
+
+### End-to-end smoke regression on CPU
+Dataset:
+- `dataset_v1` temporary subset: 32 train / 8 test
+
+Result:
+- Training completed.
+- Validation completed.
+- Best checkpoint saved.
+- Standalone evaluation completed.
+
+Observed metrics:
+- Train loss: `59.5889`
+- Val loss: `60.2253`
+- Standalone eval: `cmd_accuracy=0.4182`, `param_accuracy=0.0000`, `combined_score=0.2091`
+
+### End-to-end smoke regression on GPU
+Environment:
+- WSL
+- GPU detected by PyTorch: `NVIDIA GeForce RTX 3050 Ti Laptop GPU`
+
+Result:
+- Training completed.
+- Validation completed.
+- Best checkpoint saved.
+- Standalone evaluation completed.
+
+Observed metrics:
+- Train loss: `60.7102`
+- Val loss: `60.2660`
+- Standalone eval: `cmd_accuracy=0.4182`, `param_accuracy=0.0703`, `combined_score=0.2443`
+
+## Attempted Full 5k Short Baseline
+
+Status:
+- Partially attempted on the local WSL + 3050 Ti environment.
+- A full 5k epoch was too slow locally.
+- Bounded short-baseline support was added so the same workflow can be rerun on a stronger server.
+
+Practical guidance:
+- On server hardware, rerun `scripts/run_5k_short_baseline.sh`.
+- Review and adjust `train/config_5k_short.yaml` first.
+- If throughput is acceptable, increase `max_train_batches`, `max_val_batches`, or `num_epochs`.
+
+## Local Runtime Cleanup
+At the end of this session:
+- Leftover local training processes were stopped.
+- `nvidia-smi` showed no remaining GPU compute processes.
+
+## Files Changed In This Session
+- `data/dataset.py`
+- `eval/evaluate.py`
+- `eval/metrics.py`
+- `eval_main.py`
+- `infer.py`
+- `models/cad_decoder.py`
+- `models/dual_modal_cad.py`
+- `models/fusion.py`
+- `models/text_encoder.py`
+- `models/view_encoder.py`
+- `train/loss.py`
+- `train/train.py`
+- `train_main.py`
+- `train/config_5k_short.yaml`
+- `scripts/run_regression_smoke.sh`
+- `scripts/run_5k_short_baseline.sh`
+
+## Recommended Next Steps
+- Run `scripts/run_5k_short_baseline.sh` on a server GPU.
+- Decide on the final bounded schedule for `train/config_5k_short.yaml`.
+- If this repository needs repeatable CI coverage, convert the current smoke checks into automated tests.
+- Consider adding AMP / mixed precision and profiler-based optimization if training speed remains a bottleneck.

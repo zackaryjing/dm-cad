@@ -1,0 +1,46 @@
+model:
+  embed_dim: 512
+  n_heads: 8
+  n_layers: 6
+  max_seq_len: 120
+  n_views: 8
+  fusion_type: cross_attention
+  start_token: 4
+
+training:
+  batch_size: 4
+  num_epochs: 1
+  max_train_batches: 100
+  max_val_batches: 25
+  lr: 5.0e-05
+  weight_decay: 0.01
+  warmup_epochs: 0
+  gradient_clip: 1.0
+  num_workers: 2
+
+loss:
+  cmd_weight: 1.0
+  param_weight: 0.5
+
+optimizer:
+  type: AdamW
+  lr: 5.0e-05
+  weight_decay: 0.01
+
+scheduler:
+  type: CosineAnnealingLR
+  T_max: 1
+  eta_min: 1.0e-06
+
+data:
+  img_size: 224
+  text_max_len: 64
+  data_root: datasets/dataset_v1
+  train_ids_file: train_ids_5k.txt
+  test_ids_file: test_ids_5k.txt
+
+log:
+  log_dir: ./runs/dmcad/short_5k_baseline
+  save_dir: ./runs/dmcad/short_5k_baseline/checkpoints
+  print_freq: 10
+  val_freq: 1

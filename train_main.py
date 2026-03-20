@@ -7,10 +7,12 @@
 """
 
 import argparse
-import yaml
+
 import torch
-from train.train import Trainer
+import yaml
+
 from data.dataset import build_dataloader
+from train.train import Trainer
 
 
 def parse_args():
@@ -27,62 +29,61 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 加载配置
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
-    # 从配置中获取数据根目录
-    data_root = config.get('data', {}).get('data_root')
+    data_cfg = config.get('data', {})
+    training_cfg = config.get('training', {})
+    data_root = data_cfg.get('data_root')
     if not data_root:
         raise ValueError('data_root not specified in config file')
 
-    # 设置设备
     if args.device == 'cuda' and not torch.cuda.is_available():
         print('CUDA not available, using CPU')
         device = 'cpu'
     else:
         device = args.device
 
-    # 创建训练器
     trainer = Trainer(config, device=device)
 
-    # 恢复训练
     if args.resume:
         trainer.load_checkpoint(args.resume)
 
-    # 构建数据加载器
     print(f'Loading training data from {data_root}...')
-    train_ids_file = config.get('data', {}).get('train_ids_file')
+    train_ids_file = data_cfg.get('train_ids_file')
     train_loader = build_dataloader(
         data_root=data_root,
         split='train',
-        batch_size=config['training']['batch_size'],
-        num_workers=config['training']['num_workers'],
-        ids_file=train_ids_file
+        batch_size=training_cfg['batch_size'],
+        num_workers=training_cfg['num_workers'],
+        ids_file=train_ids_file,
+        img_size=data_cfg.get('img_size', 224),
+        text_max_len=data_cfg.get('text_max_len', 64),
     )
     if train_ids_file:
         print(f'  Using ids file: {train_ids_file}')
     print(f'  Loaded {len(train_loader.dataset)} samples')
 
     print(f'Loading validation data from {data_root}...')
-    test_ids_file = config.get('data', {}).get('test_ids_file')
+    test_ids_file = data_cfg.get('test_ids_file')
     val_loader = build_dataloader(
         data_root=data_root,
-        split='test',  # 使用 test 集作为验证集
-        batch_size=config['training']['batch_size'],
-        num_workers=config['training']['num_workers'],
-        ids_file=test_ids_file
+        split='test',
+        batch_size=training_cfg['batch_size'],
+        num_workers=training_cfg['num_workers'],
+        ids_file=test_ids_file,
+        img_size=data_cfg.get('img_size', 224),
+        text_max_len=data_cfg.get('text_max_len', 64),
     )
     if test_ids_file:
         print(f'  Using ids file: {test_ids_file}')
     print(f'  Loaded {len(val_loader.dataset)} samples')
 
-    # 开始训练
-    print(f'Starting training for {config["training"]["num_epochs"]} epochs...')
+    print(f'Starting training for {training_cfg["num_epochs"]} epochs...')
     trainer.train(
         train_loader,
         val_loader,
-        num_epochs=config['training']['num_epochs']
+        num_epochs=training_cfg['num_epochs']
     )
 
     print('Training completed!')

@@ -3,7 +3,9 @@ CAD 序列解码器模块 - 实现 CAD 命令序列生成
 基于设计文档 3.5 节和 DeepCAD 架构
 
 优化：
-- 每层 TransformerDecoder 都进行 Memory Cross-Attention，增强长序列记忆
+- 训练时使用标准 teacher forcing（右移一位）
+- 解码时使用 causal mask，避免看到未来 token
+- 推理时基于完整前缀做自回归生成
 """
 
 import torch
@@ -24,23 +26,21 @@ class CADDecoder(nn.Module):
     - 4: SOL (实体开始)
     - 5: Ext (拉伸)
     """
-    def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=120):
+    def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=120,
+                 start_token=4):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.embed_dim = embed_dim
+        self.start_token = start_token
 
-        # CAD 命令嵌入 (6 种类型：Line, Arc, Circle, EOS, SOL, Ext)
         self.n_cmd_types = 6
         self.cmd_embed = nn.Embedding(num_embeddings=self.n_cmd_types, embedding_dim=embed_dim)
 
-        # 参数嵌入 (19 维参数向量)
         self.n_params = 19
         self.param_embed = nn.Linear(self.n_params, embed_dim)
 
-        # 位置编码
         self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))
 
-        # Transformer Decoder - 每层都会使用 memory 进行交叉注意力
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
             nhead=n_heads,
@@ -50,7 +50,6 @@ class CADDecoder(nn.Module):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
 
-        # 输出头
         self.cmd_head = nn.Linear(embed_dim, self.n_cmd_types)
         self.param_head = nn.Sequential(
             nn.Linear(embed_dim, 512),
@@ -62,97 +61,104 @@ class CADDecoder(nn.Module):
         """
         Args:
             z_fused: [batch, embed_dim] - 融合后的条件向量
-            tgt_seq: 目标 CAD 序列 (training 时使用) [batch, seq_len, 20]
+            tgt_seq: [batch, seq_len, 20] - 目标 CAD 序列
         Returns:
-            cmd_logits: [batch, seq_len, 4] - 命令类型预测
-            param_pred: [batch, seq_len, 20] - 参数预测
+            cmd_logits: [batch, seq_len, 6] - 命令类型预测
+            param_pred: [batch, seq_len, 19] - 参数预测
         """
-        B = z_fused.shape[0]
+        batch_size = z_fused.shape[0]
 
-        # 准备 decoder 输入
-        if training and tgt_seq is not None:
-            # Teacher forcing - 使用完整目标序列
-            tgt_embed = self._embed_sequence(tgt_seq)
-            seq_len = tgt_embed.shape[1]
+        if tgt_seq is not None:
+            decoder_input = self._shift_right(tgt_seq)
         else:
-            # 自回归生成 - 从 START token 开始
-            tgt_embed = self.cmd_embed(torch.zeros(B, 1, dtype=torch.long).to(z_fused.device))
-            seq_len = 1
+            decoder_input = self._build_start_sequence(batch_size, z_fused.device)
 
-        # 添加位置编码
+        seq_len = decoder_input.shape[1]
+        tgt_embed = self._embed_sequence(decoder_input)
         tgt_embed = tgt_embed + self.pos_embed[:, :seq_len, :]
+        causal_mask = self._build_causal_mask(seq_len, z_fused.device)
 
-        # memory = 条件向量 (每层都会进行交叉注意力)
-        memory = z_fused.unsqueeze(1)  # [batch, 1, embed_dim]
+        memory = z_fused.unsqueeze(1)
+        output = self.transformer_decoder(tgt_embed, memory=memory, tgt_mask=causal_mask)
 
-        # Transformer 解码 - 每一层都使用 memory 进行交叉注意力
-        output = self.transformer_decoder(tgt_embed, memory=memory)
-
-        # 输出预测
         cmd_logits = self.cmd_head(output)
         param_pred = self.param_head(output)
-
         return cmd_logits, param_pred
 
     def _embed_sequence(self, seq):
-        """嵌入 CAD 序列
-        Args:
-            seq: [batch, seq_len, 20] - CAD 序列 (第 0 维是命令类型，后 19 维是参数)
-                 命令类型：0=Line, 1=Arc, 2=Circle, 3=EOS, 4=SOL, 5=Ext
-        """
-        cmd_types = seq[:, :, 0].long().clamp(0, self.n_cmd_types - 1)  # 限制命令类型在有效范围内
-        params = seq[:, :, 1:]  # 取后 19 维参数
+        """嵌入 CAD 序列"""
+        cmd_types = seq[:, :, 0].long().clamp(0, self.n_cmd_types - 1)
+        params = seq[:, :, 1:]
 
         cmd_emb = self.cmd_embed(cmd_types)
         param_emb = self.param_embed(params)
-
         return cmd_emb + param_emb
 
-        cmd_emb = self.cmd_embed(cmd_types)
-        param_emb = self.param_embed(params)
+    def _build_start_sequence(self, batch_size, device):
+        start_seq = torch.zeros(batch_size, 1, self.n_params + 1, device=device)
+        start_seq[:, 0, 0] = self.start_token
+        return start_seq
 
-        return cmd_emb + param_emb
+    def _shift_right(self, tgt_seq):
+        start_seq = self._build_start_sequence(tgt_seq.shape[0], tgt_seq.device)
+        return torch.cat([start_seq, tgt_seq[:, :-1, :]], dim=1)
+
+    def _build_causal_mask(self, seq_len, device):
+        return torch.triu(
+            torch.full((seq_len, seq_len), float('-inf'), device=device),
+            diagonal=1
+        )
 
     def generate(self, z_fused, max_steps=120):
         """自回归生成 CAD 序列
 
-        Args:
-            z_fused: [batch, embed_dim] - 融合条件向量
-            max_steps: 最大生成长度
         Returns:
-            generated: 生成的命令序列列表
+            cmd_tensor: [batch, steps] - 生成的命令类型
+            param_tensor: [batch, steps, 19] - 生成的参数
         """
-        B = z_fused.shape[0]
+        batch_size = z_fused.shape[0]
         device = z_fused.device
 
-        generated = []
-        current_input = self.cmd_embed(torch.zeros(B, 1, dtype=torch.long).to(device))
+        generated_cmds = []
+        generated_params = []
+        decoder_seq = self._build_start_sequence(batch_size, device)
+        ended = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        memory = z_fused.unsqueeze(1)
 
-        # 跟踪每个样本的生成状态
-        ended = torch.zeros(B, dtype=torch.bool, device=device)  # 标记每个样本是否结束
+        for _ in range(max_steps):
+            seq_len = decoder_seq.shape[1]
+            tgt_embed = self._embed_sequence(decoder_seq)
+            tgt_embed = tgt_embed + self.pos_embed[:, :seq_len, :]
+            causal_mask = self._build_causal_mask(seq_len, device)
 
-        for step in range(max_steps):
-            current_input = current_input + self.pos_embed[:, step:step+1, :]
-            memory = z_fused.unsqueeze(1)  # [batch, 1, embed_dim]
+            output = self.transformer_decoder(tgt_embed, memory=memory, tgt_mask=causal_mask)
+            last_hidden = output[:, -1:, :]
 
-            # Transformer 解码 - 每一层都使用 memory 进行交叉注意力
-            output = self.transformer_decoder(current_input, memory=memory)
+            cmd_logits = self.cmd_head(last_hidden)
+            param_pred = self.param_head(last_hidden)
+            cmd_pred = torch.argmax(cmd_logits, dim=-1)
 
-            cmd_logits = self.cmd_head(output[:, -1:, :])
-            param_pred = self.param_head(output[:, -1:, :])
+            if generated_cmds:
+                prev_cmd = generated_cmds[-1]
+                prev_param = generated_params[-1]
+                cmd_pred = torch.where(ended.unsqueeze(-1), prev_cmd, cmd_pred)
+                param_pred = torch.where(ended.unsqueeze(-1).unsqueeze(-1), prev_param, param_pred)
 
-            cmd_pred = torch.argmax(cmd_logits, dim=-1)  # [B, 1]
+            generated_cmds.append(cmd_pred)
+            generated_params.append(param_pred)
 
-            generated.append((cmd_pred, param_pred))
+            ended = ended | (cmd_pred.squeeze(-1) == 3)
+            next_token = torch.cat([cmd_pred.float().unsqueeze(-1), param_pred], dim=-1)
+            decoder_seq = torch.cat([decoder_seq, next_token], dim=1)
 
-            # 检查是否所有样本都结束
-            current_ended = (cmd_pred.squeeze(-1) == 3)  # END token
-            ended = ended | current_ended
             if ended.all():
                 break
 
-            # 准备下一步输入 (仅对未结束的样本更新)
-            next_embed = self.cmd_embed(cmd_pred) + self.param_embed(param_pred)
-            current_input = next_embed
+        if generated_cmds:
+            cmd_tensor = torch.cat(generated_cmds, dim=1)
+            param_tensor = torch.cat(generated_params, dim=1)
+        else:
+            cmd_tensor = torch.empty(batch_size, 0, dtype=torch.long, device=device)
+            param_tensor = torch.empty(batch_size, 0, self.n_params, device=device)
 
-        return generated
+        return cmd_tensor, param_tensor

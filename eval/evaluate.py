@@ -5,110 +5,144 @@
 import torch
 from tqdm import tqdm
 
-from eval.metrics import CADMetrics
+from eval.metrics import CADMetrics, CMD_PARAM_MASK
 
 
 class Evaluator:
     """模型评估器"""
 
     def __init__(self, model, device='cuda'):
-        """
-        Args:
-            model: 待评估模型
-            device: 评估设备
-        """
         self.model = model
         self.device = device
         self.metrics_calculator = CADMetrics()
 
     @torch.no_grad()
-    def evaluate(self, dataloader):
-        """在数据集上评估模型
-
-        Args:
-            dataloader: 数据加载器
-        Returns:
-            results: 评估结果字典
-        """
+    def evaluate(self, dataloader, max_batches=None):
+        """在数据集上评估模型"""
         self.model.eval()
 
-        all_pred_cmds = []
-        all_param_preds = []
-        all_gt_cmds = []
-        all_gt_params = []
-        all_valid_masks = []
+        total_cmd_correct = 0.0
+        total_cmd_count = 0
+        total_param_correct = 0.0
+        total_param_count = 0
+        total_batches = len(dataloader)
+        effective_batches = min(total_batches, max_batches) if max_batches else total_batches
+        processed_batches = 0
 
-        for batch in tqdm(dataloader, desc='Evaluating'):
+        for batch in tqdm(dataloader, desc='Evaluating', total=effective_batches):
             images = batch['images'].to(self.device)
             text_input_ids = batch['text_input_ids'].to(self.device)
             text_attention_mask = batch['text_attention_mask'].to(self.device)
             cad_seq = batch['cad_seq'].to(self.device)
             cad_valid_mask = batch['cad_valid_mask'].to(self.device)
 
-            # 模型预测
-            cmd_logits, param_pred = self.model(
-                images, text_input_ids, text_attention_mask
+            seq_len = cad_seq.shape[1]
+            cmd_pred, param_pred = self.model.generate(
+                images,
+                text_input_ids,
+                text_attention_mask,
+                max_steps=seq_len
             )
+            cmd_pred, param_pred = self._pad_generated_outputs(cmd_pred, param_pred, seq_len)
 
-            # 获取预测命令
-            cmd_pred = torch.argmax(cmd_logits, dim=-1)
-
-            # 收集结果
-            all_pred_cmds.append(cmd_pred)
-            all_param_preds.append(param_pred)
-
-            # Ground truth
-            gt_cmds = cad_seq[:, :, 0].long()
+            gt_cmds = cad_seq[:, :, 0].long().clamp(min=0)
             gt_params = cad_seq[:, :, 1:]
-            all_gt_cmds.append(gt_cmds)
-            all_gt_params.append(gt_params)
-            all_valid_masks.append(cad_valid_mask)
+            valid_mask = cad_valid_mask.bool()
 
-        # 合并所有批次结果
-        pred_cmds = torch.cat(all_pred_cmds, dim=0)
-        param_preds = torch.cat(all_param_preds, dim=0)
-        gt_cmds = torch.cat(all_gt_cmds, dim=0)
-        gt_params = torch.cat(all_gt_params, dim=0)
-        valid_masks = torch.cat(all_valid_masks, dim=0)
+            if valid_mask.any():
+                cmd_matches = (cmd_pred == gt_cmds)[valid_mask].float()
+                total_cmd_correct += cmd_matches.sum().item()
+                total_cmd_count += cmd_matches.numel()
 
-        # 计算指标
-        metrics = self.metrics_calculator.compute_all_metrics(
-            pred_cmds, param_preds, gt_cmds, gt_params, valid_masks
-        )
+                cmd_mask = CMD_PARAM_MASK.to(self.device)[gt_cmds]
+                combined_mask = valid_mask.unsqueeze(-1) & cmd_mask
+                if combined_mask.any():
+                    param_matches = (torch.abs(param_pred - gt_params) < self.metrics_calculator.param_threshold)[combined_mask].float()
+                    total_param_correct += param_matches.sum().item()
+                    total_param_count += param_matches.numel()
 
-        return metrics
+            processed_batches += 1
+            if max_batches and processed_batches >= max_batches:
+                break
+
+        if total_cmd_count == 0:
+            return self.metrics_calculator.empty_metrics()
+
+        cmd_accuracy = total_cmd_correct / total_cmd_count
+        param_accuracy = (total_param_correct / total_param_count) if total_param_count > 0 else 0.0
+        return {
+            'cmd_accuracy': cmd_accuracy,
+            'param_accuracy': param_accuracy,
+            'combined_score': 0.5 * cmd_accuracy + 0.5 * param_accuracy,
+        }
 
     @torch.no_grad()
-    def generate_and_save(self, dataloader, save_path=None):
-        """生成 CAD 序列并保存
-
-        Args:
-            dataloader: 数据加载器
-            save_path: 保存路径
-        Returns:
-            generated_sequences: 生成的序列列表
-        """
+    def generate_and_save(self, dataloader, save_path=None, max_batches=None):
+        """生成 CAD 序列并保存"""
         self.model.eval()
         generated_sequences = []
+        total_batches = len(dataloader)
+        effective_batches = min(total_batches, max_batches) if max_batches else total_batches
+        processed_batches = 0
 
-        for batch in tqdm(dataloader, desc='Generating'):
+        for batch in tqdm(dataloader, desc='Generating', total=effective_batches):
             images = batch['images'].to(self.device)
             text_input_ids = batch['text_input_ids'].to(self.device)
             text_attention_mask = batch['text_attention_mask'].to(self.device)
-            uids = batch['uids']
+            sample_ids = batch['sample_ids']
 
-            # 生成
-            generated = self.model.generate(
-                images, text_input_ids, text_attention_mask
+            cmd_pred, param_pred = self.model.generate(
+                images,
+                text_input_ids,
+                text_attention_mask
             )
 
-            # 保存结果
-            for uid, gen in zip(uids, generated):
-                seq_data = {'uid': uid, 'commands': gen}
-                generated_sequences.append(seq_data)
+            for idx, sample_id in enumerate(sample_ids):
+                cmd_seq = cmd_pred[idx].detach().cpu()
+                param_seq = param_pred[idx].detach().cpu()
+                commands = [
+                    {
+                        'cmd': int(cmd_seq[step].item()),
+                        'params': param_seq[step].tolist(),
+                    }
+                    for step in range(cmd_seq.shape[0])
+                ]
+                generated_sequences.append({
+                    'sample_id': sample_id,
+                    'commands': commands,
+                })
 
-        # 保存
+            processed_batches += 1
+            if max_batches and processed_batches >= max_batches:
+                break
+
         if save_path:
             torch.save(generated_sequences, save_path)
 
         return generated_sequences
+
+    def _pad_generated_outputs(self, cmd_pred, param_pred, target_len):
+        """将生成序列对齐到目标长度，便于和 GT 对比。"""
+        batch_size = cmd_pred.shape[0]
+        current_len = cmd_pred.shape[1]
+        if current_len == target_len:
+            return cmd_pred, param_pred
+
+        if current_len > target_len:
+            return cmd_pred[:, :target_len], param_pred[:, :target_len, :]
+
+        pad_len = target_len - current_len
+        cmd_pad = torch.full(
+            (batch_size, pad_len),
+            3,
+            dtype=cmd_pred.dtype,
+            device=cmd_pred.device
+        )
+        param_pad = torch.zeros(
+            batch_size,
+            pad_len,
+            param_pred.shape[-1],
+            dtype=param_pred.dtype,
+            device=param_pred.device
+        )
+        return torch.cat([cmd_pred, cmd_pad], dim=1), torch.cat([param_pred, param_pad], dim=1)
