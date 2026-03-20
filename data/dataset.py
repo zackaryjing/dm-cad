@@ -62,23 +62,32 @@ class CADDataset(Dataset):
         self._preload_text_descriptions()
 
     def _load_data_list(self, ids_file):
-        """加载数据索引"""
-        # 优先使用 ids_file 参数
+        """加载数据索引
+
+        Args:
+            ids_file: 如果提供，优先从 data_root/ids_file 查找；
+                     如果是绝对路径则直接使用；
+                     如果未提供，使用默认的 {split}_ids.txt
+        """
+        # 确定 ids 文件路径
         if ids_file is not None:
-            if os.path.exists(ids_file):
-                with open(ids_file, 'r') as f:
-                    return [line.strip() for line in f if line.strip()]
+            # 如果是绝对路径，直接使用
+            if os.path.isabs(ids_file):
+                ids_path = ids_file
             else:
-                print(f"Warning: ids file not found: {ids_file}")
-                return []
+                # 相对路径：拼接到 data_root
+                ids_path = os.path.join(self.data_root, ids_file)
+        else:
+            # 默认使用 {split}_ids.txt
+            ids_path = os.path.join(self.data_root, f'{self.split}_ids.txt')
 
-        # 默认使用 {split}_ids.txt
-        default_ids_file = os.path.join(self.data_root, f'{self.split}_ids.txt')
-        if os.path.exists(default_ids_file):
-            with open(default_ids_file, 'r') as f:
+        # 加载文件
+        if os.path.exists(ids_path):
+            with open(ids_path, 'r') as f:
                 return [line.strip() for line in f if line.strip()]
-
-        return []
+        else:
+            print(f"Warning: ids file not found: {ids_path}")
+            return []
 
     def _preload_text_descriptions(self):
         """预加载所有需要的文本描述到缓存"""

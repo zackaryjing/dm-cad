@@ -10,13 +10,13 @@ model:
   fusion_type: 'cross_attention'  # 'concat', 'cross_attention', 'gating'
 
 training:
-  batch_size: 32
+  batch_size: 4
   num_epochs: 80
   lr: 5.0e-05
   weight_decay: 0.01
   warmup_epochs: 5
   gradient_clip: 1.0
-  num_workers: 4
+  num_workers: 2
 
 loss:
   cmd_weight: 1.0
@@ -35,9 +35,7 @@ scheduler:
 data:
   img_size: 224
   text_max_len: 64
-  data_root: 'datasets/dataset_v0'
-  # 数据子集配置（可选，留空则使用默认的 {split}_ids.txt）
-  # 可选值：train_ids.txt, train_ids_20k.txt, train_ids_5k.txt
+  data_root: 'datasets/dataset_v1'
   train_ids_file: train_ids_5k.txt
   test_ids_file: test_ids_5k.txt
 

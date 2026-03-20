@@ -11,17 +11,17 @@ dmcad/
 │   ├── view_encoder.py      # 视图编码器 (ViT + 多视图融合)
 │   ├── text_encoder.py      # 文本编码器 (BERT)
 │   ├── fusion.py            # 双模态融合模块
-│   ├── cad_decoder.py       # CAD 序列解码器
+│   ├── cad_decoder.py       # CAD 序列解码器 (6 命令类型，19 参数)
 │   └── dual_modal_cad.py    # 完整模型
 ├── data/
 │   ├── __init__.py
-│   ├── dataset.py           # 数据集类
+│   ├── dataset.py           # 数据集类 (DeepCAD 格式)
 │   ├── renderer.py          # CAD 渲染 pipeline
 │   └── augment.py           # 数据增强
 ├── train/
 │   ├── __init__.py
 │   ├── train.py             # 训练脚本
-│   ├── loss.py              # 损失函数
+│   ├── loss.py              # 损失函数 (6 命令类型掩码)
 │   └── config.yaml          # 配置文件
 ├── eval/
 │   ├── __init__.py
@@ -42,28 +42,31 @@ dmcad/
 
 ```bash
 # 创建 conda 环境
-conda create -n dmcad python=3.10
-conda activate dmcad
+conda activate /home/jing/allprojects/pythonenvironment/dmcad
 
-# 安装依赖
-pip install -r requirements.txt
+# 依赖已在 environment.yml 中定义
 ```
 
 ## 训练
 
 ```bash
-# 使用默认配置训练
-python train_main.py --config train/config.yaml --data_dir ./data
+# 使用默认配置训练 (data_root 从 config.yaml 读取)
+python train_main.py --config train/config.yaml
 
 # 从检查点恢复训练
-python train_main.py --config train/config.yaml --data_dir ./data --resume checkpoints/epoch_10.pth
+python train_main.py --config train/config.yaml --resume checkpoints/epoch_10.pth
 ```
+
+**配置说明** (`train/config.yaml`):
+- `data.data_root`: 数据集根目录 (默认：`datasets/dataset_v1`)
+- `data.train_ids_file`: 训练集 ids 文件 (**相对于 data_root**)
+- `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
 
 ## 评估
 
 ```bash
 # 在测试集上评估
-python eval_main.py --checkpoint checkpoints/best.pth --data_dir ./data/test
+python eval_main.py --checkpoint checkpoints/best.pth
 ```
 
 ## 推理
@@ -98,37 +101,93 @@ python infer.py \
 │         CAD Decoder (Transformer)                           │
 │                    ↓                                        │
 │    Command Head    Parameter Head                           │
-│    (4 classes)     (19 dim)                                 │
+│    (6 classes)     (19 dim)                                 │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## 数据集格式
 
-训练数据应组织为以下格式：
+使用 DeepCAD 原始格式，数据组织如下：
 
 ```
-data/
-├── train.json             # 训练数据索引
-├── val.json               # 验证数据索引
-├── test.json              # 测试数据索引
-├── images/
-│   └── <uid>/
-│       ├── view_00.png
-│       ├── view_01.png
-│       └── ...
-└── cad_seq/
-    ├── <uid>.pt
-    └── ...
+datasets/dataset_v1/
+├── train_ids_5k.txt         # 训练样本 ID 列表
+├── test_ids_5k.txt          # 测试样本 ID 列表
+├── cad_desc/
+│   └── <group_id>.json      # 文本描述 (按 group_id 组织)
+├── cad_img/
+│   └── <group_id>/
+│       └── <sample_id>/
+│           ├── <sample_id>_000.png
+│           ├── <sample_id>_001.png
+│           └── ... (8 个视图)
+└── cad_vec/
+    └── <group_id>/
+        └── <sample_id>.h5   # CAD 向量序列
+```
+
+## 关键设计说明
+
+### 命令类型 (6 种，DeepCAD 格式)
+
+| ID | 名称 | 说明 | 有效参数维度 |
+|----|------|------|-------------|
+| 0 | Line | 线段 | x, y (终点坐标) |
+| 1 | Arc | 圆弧 | x, y, alpha, f |
+| 2 | Circle | 圆 | x, y, r |
+| 3 | EOS | 序列结束 | 无 |
+| 4 | SOL | 实体开始 | 无 |
+| 5 | Ext | 拉伸 | 11 维挤压参数 |
+
+### CAD 序列格式
+
+- **Shape**: `[seq_len, 20]`
+- **结构**: `[cmd_type, param_0, param_1, ..., param_18]`
+  - `cmd_type`: 命令类型 (0-5)
+  - `param_*`: 19 维参数
+
+### 张量维度说明
+
+| 模块 | 输入 | 输出 |
+|------|------|------|
+| ViewEncoder | `[B, 3, 224, 224]` | `[B, 512]` |
+| MultiViewFusion | `[B, 8, 512]` | `[B, 512]` |
+| TextEncoder | `[B, seq_len]` | `[B, 512]` |
+| ModalFusion | `[B, 512], [B, 512]` | `[B, 512]` |
+| CADDecoder | `[B, 512], [B, T, 20]` | `[B, T, 6]`, `[B, T, 19]` |
+
+### 损失函数
+
+```
+L_total = cmd_weight * L_cmd + param_weight * L_param
+
+L_cmd = CrossEntropy(cmd_logits, cmd_gt)  # 6 类
+L_param = SmoothL1(param_pred, param_gt)  # 19 维，仅有效位置计算
 ```
 
 ## 评估指标
 
 | 指标 | 说明 |
 |------|------|
-| Command Accuracy | 命令类型预测准确率 |
+| Command Accuracy | 命令类型预测准确率 (6 类) |
 | Parameter Accuracy | 参数预测准确率 (相对误差<0.1) |
-| Chamfer Distance | 几何形状相似度 |
+| Chamfer Distance | 几何形状相似度 (点云) |
 | Invalidity Ratio | 生成无效序列比例 |
+
+## 常见问题
+
+### 数据路径问题
+- ids 文件路径**相对于 `data_root`**，在 `train/config.yaml` 中配置
+- 训练时不需传递 `--data_dir`，直接从配置文件读取
+
+### 命令类型不匹配
+- 模型使用 **6 种命令类型** (DeepCAD 原始格式)
+- 早期设计使用 4 种命令类型 (START/SKETCH/EXTRUDE/END)，已过时
+
+### 维度不匹配
+- CAD 序列：20 维 = 1 命令类型 + 19 参数
+- 参数预测输出：**19 维** (不是 20 维)
+- `cad_valid_mask` 过滤无效位置 (cmd_type < 0)
 
 ## 参考文献
 

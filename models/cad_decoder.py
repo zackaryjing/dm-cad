@@ -15,17 +15,27 @@ class CADDecoder(nn.Module):
 
     将融合特征解码为 CAD 命令序列 (sketch + extrusion 操作)
     每层都进行 Memory Cross-Attention，确保层层感知条件信息
+
+    命令类型（适配 DeepCAD 原始数据）:
+    - 0: Line (线段)
+    - 1: Arc (圆弧)
+    - 2: Circle (圆)
+    - 3: EOS (序列结束)
+    - 4: SOL (实体开始)
+    - 5: Ext (拉伸)
     """
     def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=120):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.embed_dim = embed_dim
 
-        # CAD 命令嵌入 (4 种类型：START, SKETCH, EXTRUDE, END)
-        self.cmd_embed = nn.Embedding(num_embeddings=4, embedding_dim=embed_dim)
+        # CAD 命令嵌入 (6 种类型：Line, Arc, Circle, EOS, SOL, Ext)
+        self.n_cmd_types = 6
+        self.cmd_embed = nn.Embedding(num_embeddings=self.n_cmd_types, embedding_dim=embed_dim)
 
-        # 参数嵌入 (20 维参数向量，适配数据加载器的 padding)
-        self.param_embed = nn.Linear(20, embed_dim)
+        # 参数嵌入 (19 维参数向量)
+        self.n_params = 19
+        self.param_embed = nn.Linear(self.n_params, embed_dim)
 
         # 位置编码
         self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))
@@ -41,11 +51,11 @@ class CADDecoder(nn.Module):
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
 
         # 输出头
-        self.cmd_head = nn.Linear(embed_dim, 4)  # START, SKETCH, EXTRUDE, END
+        self.cmd_head = nn.Linear(embed_dim, self.n_cmd_types)
         self.param_head = nn.Sequential(
             nn.Linear(embed_dim, 512),
             nn.ReLU(),
-            nn.Linear(512, 20)
+            nn.Linear(512, self.n_params)
         )
 
     def forward(self, z_fused, tgt_seq=None, training=True):
@@ -88,10 +98,15 @@ class CADDecoder(nn.Module):
         """嵌入 CAD 序列
         Args:
             seq: [batch, seq_len, 20] - CAD 序列 (第 0 维是命令类型，后 19 维是参数)
-                 命令类型：0=START, 1=SKETCH, 2=EXTRUDE, 3=END
+                 命令类型：0=Line, 1=Arc, 2=Circle, 3=EOS, 4=SOL, 5=Ext
         """
-        cmd_types = seq[:, :, 0].long().clamp(0, 3)  # 限制命令类型在有效范围内
-        params = seq[:, :, :]  # 使用全部 20 维
+        cmd_types = seq[:, :, 0].long().clamp(0, self.n_cmd_types - 1)  # 限制命令类型在有效范围内
+        params = seq[:, :, 1:]  # 取后 19 维参数
+
+        cmd_emb = self.cmd_embed(cmd_types)
+        param_emb = self.param_embed(params)
+
+        return cmd_emb + param_emb
 
         cmd_emb = self.cmd_embed(cmd_types)
         param_emb = self.param_embed(params)

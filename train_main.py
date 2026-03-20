@@ -3,7 +3,7 @@
 训练入口脚本
 
 用法:
-    python train_main.py --config train/config.yaml --data_dir datasets/dataset_v0
+    python train_main.py --config train/config.yaml
 """
 
 import argparse
@@ -17,8 +17,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train Dual-Modal CAD Generator')
     parser.add_argument('--config', type=str, default='train/config.yaml',
                         help='Path to config file')
-    parser.add_argument('--data_dir', type=str, default='datasets/dataset_v0',
-                        help='Path to data directory (default: datasets/dataset_v0)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--device', type=str, default='cuda',
@@ -32,6 +30,11 @@ def main():
     # 加载配置
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # 从配置中获取数据根目录
+    data_root = config.get('data', {}).get('data_root')
+    if not data_root:
+        raise ValueError('data_root not specified in config file')
 
     # 设置设备
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -48,10 +51,10 @@ def main():
         trainer.load_checkpoint(args.resume)
 
     # 构建数据加载器
-    print(f'Loading training data from {args.data_dir}...')
+    print(f'Loading training data from {data_root}...')
     train_ids_file = config.get('data', {}).get('train_ids_file')
     train_loader = build_dataloader(
-        data_root=args.data_dir,
+        data_root=data_root,
         split='train',
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers'],
@@ -61,10 +64,10 @@ def main():
         print(f'  Using ids file: {train_ids_file}')
     print(f'  Loaded {len(train_loader.dataset)} samples')
 
-    print(f'Loading validation data from {args.data_dir}...')
+    print(f'Loading validation data from {data_root}...')
     test_ids_file = config.get('data', {}).get('test_ids_file')
     val_loader = build_dataloader(
-        data_root=args.data_dir,
+        data_root=data_root,
         split='test',  # 使用 test 集作为验证集
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers'],

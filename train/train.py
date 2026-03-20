@@ -91,6 +91,10 @@ class Trainer:
             cmd_gt = cad_seq[:, :, 0].long()
             param_gt = cad_seq[:, :, 1:]
 
+            # 将无效的命令类型（负数）替换为 0，避免 CrossEntropyLoss 报错
+            # valid_mask 会过滤掉这些位置的损失
+            cmd_gt = cmd_gt.clamp(min=0)
+
             # 计算损失
             loss, loss_dict = self.criterion(
                 cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
@@ -146,6 +150,9 @@ class Trainer:
 
             cmd_gt = cad_seq[:, :, 0].long()
             param_gt = cad_seq[:, :, 1:]
+
+            # 将无效的命令类型（负数）替换为 0，避免 CrossEntropyLoss 报错
+            cmd_gt = cmd_gt.clamp(min=0)
 
             loss, _ = self.criterion(
                 cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
