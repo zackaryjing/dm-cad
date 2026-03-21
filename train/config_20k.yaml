@@ -7,7 +7,7 @@ model:
   n_layers: 6
   max_seq_len: 120
   n_views: 8
-  fusion_type: 'cross_attention'  # 'concat', 'cross_attention', 'gating'
+  fusion_type: cross_attention  # concat, cross_attention, gating
 
 training:
   batch_size: 32
@@ -23,30 +23,30 @@ loss:
   param_weight: 0.5
 
 optimizer:
-  type: 'AdamW'
+  type: AdamW
   lr: 5.0e-05
   weight_decay: 0.01
 
 scheduler:
-  type: 'CosineAnnealingLR'
+  type: CosineAnnealingLR
   T_max: 80
   eta_min: 1.0e-06
 
 data:
   img_size: 224
   text_max_len: 64
-  data_root: 'datasets/dataset_v0'
-  # 数据子集配置（可选，留空则使用默认的 {split}_ids.txt）
-  # 可选值：train_ids.txt, train_ids_20k.txt, train_ids_5k.txt
-  train_ids_file: train_ids_5k.txt
-  test_ids_file: test_ids_5k.txt
+  data_root: datasets/dataset_v0
+  train_ids_file: train_ids_20k.txt
+  test_ids_file: test_ids_20k.txt
 
 log:
-  log_dir: './runs/dmcad'
-  save_dir: './checkpoints'
+  log_dir: ./runs/dmcad
+  save_dir: ./checkpoints
   print_freq: 10
   val_freq: 1
 
 device:
-  cuda: true
-  gpu_id: 0
+  type: cuda
+  visible_devices: [0]
+  use_data_parallel: false
+  output_device: 0

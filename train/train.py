@@ -7,6 +7,7 @@ import os
 import time
 
 import torch
+from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -21,16 +22,19 @@ class Trainer:
 
     def __init__(self, config, device='cuda'):
         self.config = config
-        self.device = device
+        self.requested_device = device
+        self.device_cfg = config.get('device', {})
+        self.device = self._resolve_runtime_device(device)
 
-        self.model = DualModalCADGenerator(config.get('model', {}))
-        self.model.to(device)
+        base_model = DualModalCADGenerator(config.get('model', {}))
+        self.model = self._wrap_model_for_parallel(base_model)
+        self.model.to(self.device)
 
         loss_cfg = config.get('loss', {})
         self.criterion = CADLoss(
             cmd_weight=loss_cfg.get('cmd_weight', 1.0),
             param_weight=loss_cfg.get('param_weight', 0.5)
-        )
+        ).to(self.device)
 
         optimizer_cfg = config.get('optimizer', {})
         self.optimizer = AdamW(
@@ -53,6 +57,44 @@ class Trainer:
         self.log_dir = log_cfg.get('log_dir', config.get('log_dir', 'runs/dmcad'))
         self.writer = SummaryWriter(self.log_dir)
 
+    def _resolve_runtime_device(self, requested_device):
+        if requested_device != 'cuda' or not torch.cuda.is_available():
+            return torch.device(requested_device)
+
+        output_device = int(self.device_cfg.get('output_device', 0))
+        return torch.device(f'cuda:{output_device}')
+
+    def _wrap_model_for_parallel(self, model):
+        if self.requested_device != 'cuda' or not torch.cuda.is_available():
+            return model
+
+        visible_gpu_count = torch.cuda.device_count()
+        use_data_parallel = bool(self.device_cfg.get('use_data_parallel', False))
+        if not use_data_parallel:
+            return model
+
+        if visible_gpu_count <= 1:
+            print('DataParallel requested but fewer than 2 CUDA devices are visible; using single GPU.')
+            return model
+
+        output_device = int(self.device_cfg.get('output_device', 0))
+        device_ids = list(range(visible_gpu_count))
+        print(f'Enabling DataParallel on visible CUDA devices: {device_ids}')
+        return nn.DataParallel(model, device_ids=device_ids, output_device=output_device)
+
+    def _model_to_save(self):
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+    def _load_state_dict_flexible(self, model, state_dict):
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError:
+            stripped = {
+                key.replace('module.', '', 1) if key.startswith('module.') else key: value
+                for key, value in state_dict.items()
+            }
+            model.load_state_dict(stripped)
+
     def train_one_epoch(self, dataloader):
         """训练一个 epoch"""
         self.model.train()
@@ -69,11 +111,11 @@ class Trainer:
 
         processed_batches = 0
         for batch in pbar:
-            images = batch['images'].to(self.device)
-            text_input_ids = batch['text_input_ids'].to(self.device)
-            text_attention_mask = batch['text_attention_mask'].to(self.device)
-            cad_seq = batch['cad_seq'].to(self.device)
-            cad_valid_mask = batch['cad_valid_mask'].to(self.device)
+            images = batch['images'].to(self.device, non_blocking=True)
+            text_input_ids = batch['text_input_ids'].to(self.device, non_blocking=True)
+            text_attention_mask = batch['text_attention_mask'].to(self.device, non_blocking=True)
+            cad_seq = batch['cad_seq'].to(self.device, non_blocking=True)
+            cad_valid_mask = batch['cad_valid_mask'].to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad()
             cmd_logits, param_pred = self.model(
@@ -128,11 +170,11 @@ class Trainer:
         processed_batches = 0
 
         for batch in tqdm(dataloader, desc='Validating', total=effective_batches):
-            images = batch['images'].to(self.device)
-            text_input_ids = batch['text_input_ids'].to(self.device)
-            text_attention_mask = batch['text_attention_mask'].to(self.device)
-            cad_seq = batch['cad_seq'].to(self.device)
-            cad_valid_mask = batch['cad_valid_mask'].to(self.device)
+            images = batch['images'].to(self.device, non_blocking=True)
+            text_input_ids = batch['text_input_ids'].to(self.device, non_blocking=True)
+            text_attention_mask = batch['text_attention_mask'].to(self.device, non_blocking=True)
+            cad_seq = batch['cad_seq'].to(self.device, non_blocking=True)
+            cad_valid_mask = batch['cad_valid_mask'].to(self.device, non_blocking=True)
 
             cmd_logits, param_pred = self.model(
                 images, text_input_ids, text_attention_mask, cad_seq
@@ -203,7 +245,7 @@ class Trainer:
         checkpoint_path = os.path.join(self.log_dir, 'checkpoints', filename)
         torch.save({
             'epoch': self.epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': self._model_to_save().state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
@@ -214,7 +256,7 @@ class Trainer:
     def load_checkpoint(self, checkpoint_path):
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self._load_state_dict_flexible(self._model_to_save(), checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.epoch = checkpoint['epoch'] + 1

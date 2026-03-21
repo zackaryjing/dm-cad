@@ -44,3 +44,9 @@ log:
   save_dir: ./runs/dmcad/short_5k_baseline/checkpoints
   print_freq: 10
   val_freq: 1
+
+device:
+  type: cuda
+  visible_devices: [0]
+  use_data_parallel: false
+  output_device: 0

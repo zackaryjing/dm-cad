@@ -9,12 +9,9 @@
 
 import argparse
 
-import torch
 import yaml
 
-from data.dataset import build_dataloader
-from eval.evaluate import Evaluator
-from models.dual_modal_cad import DualModalCADGenerator
+from runtime_device import apply_visible_devices, resolve_device_type
 
 
 def parse_args():
@@ -31,11 +28,22 @@ def parse_args():
                         help='Batch size for evaluation (default: from config or 32)')
     parser.add_argument('--max_batches', type=int, default=None,
                         help='Maximum number of evaluation batches (default: from config or all)')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use for evaluation')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Optional device override, e.g. cuda or cpu')
     parser.add_argument('--output', type=str, default=None,
                         help='Path to save generated sequences')
     return parser.parse_args()
+
+
+def _load_state_dict_flexible(model, state_dict):
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError:
+        stripped = {
+            key.replace('module.', '', 1) if key.startswith('module.') else key: value
+            for key, value in state_dict.items()
+        }
+        model.load_state_dict(stripped)
 
 
 def main():
@@ -47,20 +55,31 @@ def main():
             config = yaml.safe_load(f)
         print(f'Loaded config from {args.config}')
 
+    visible_devices = apply_visible_devices(config)
+
+    import torch
+    from data.dataset import build_dataloader
+    from eval.evaluate import Evaluator
+    from models.dual_modal_cad import DualModalCADGenerator
+
     data_cfg = config.get('data', {})
     training_cfg = config.get('training', {})
 
-    if args.device == 'cuda' and not torch.cuda.is_available():
+    requested_device = resolve_device_type(config, args.device)
+    if requested_device == 'cuda' and not torch.cuda.is_available():
         print('CUDA not available, using CPU')
         device = 'cpu'
     else:
-        device = args.device
+        device = requested_device
+
+    if visible_devices:
+        print(f'Using CUDA_VISIBLE_DEVICES={visible_devices}')
 
     print(f'Loading model from {args.checkpoint}...')
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model_config = checkpoint.get('config', {}).get('model', checkpoint.get('config', {}))
     model = DualModalCADGenerator(model_config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    _load_state_dict_flexible(model, checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
 

@@ -8,11 +8,9 @@
 
 import argparse
 
-import torch
 import yaml
 
-from data.dataset import build_dataloader
-from train.train import Trainer
+from runtime_device import apply_visible_devices, resolve_device_type
 
 
 def parse_args():
@@ -21,8 +19,8 @@ def parse_args():
                         help='Path to config file')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use for training')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Optional device override, e.g. cuda or cpu')
     return parser.parse_args()
 
 
@@ -32,17 +30,29 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
+    visible_devices = apply_visible_devices(config)
+
+    import torch
+    from data.dataset import build_dataloader
+    from train.train import Trainer
+
     data_cfg = config.get('data', {})
     training_cfg = config.get('training', {})
     data_root = data_cfg.get('data_root')
     if not data_root:
         raise ValueError('data_root not specified in config file')
 
-    if args.device == 'cuda' and not torch.cuda.is_available():
+    requested_device = resolve_device_type(config, args.device)
+    if requested_device == 'cuda' and not torch.cuda.is_available():
         print('CUDA not available, using CPU')
         device = 'cpu'
     else:
-        device = args.device
+        device = requested_device
+
+    if visible_devices:
+        print(f'Using CUDA_VISIBLE_DEVICES={visible_devices}')
+    if device == 'cuda':
+        print(f'Visible CUDA devices inside process: {torch.cuda.device_count()}')
 
     trainer = Trainer(config, device=device)
 
