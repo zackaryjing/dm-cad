@@ -47,6 +47,6 @@ log:
 
 device:
   type: cuda
-  visible_devices: [0]
+  visible_devices: [0,5]
   use_data_parallel: false
   output_device: 0
