@@ -4,6 +4,7 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 
 def visualize_cad_sequence(cad_sequence, save_path=None):
