@@ -1,6 +1,5 @@
 __pycache__
-datasets/dataset_v0
-datasets/dataset_v1
+datasets/*
 *.zip
 .vscode
 runs
