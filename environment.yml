@@ -45,4 +45,4 @@ dependencies:
 
       # geometry / CAD utils
       - trimesh
-      - opencv-python
+      - h5py
