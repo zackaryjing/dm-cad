@@ -12,6 +12,7 @@ Suggested actions:
 - Keep DP/DDP in separate config files instead of the main default config.
 
 ### 2. Add AMP mixed precision
+Status: done on 2026-03-24.
 Reason:
 - The main crash started from CUDA OOM in the ViT image branch.
 - AMP is the lowest-complexity way to reduce memory use on RTX 4090 while keeping the project understandable.
@@ -20,7 +21,13 @@ Suggested actions:
 - Add `torch.cuda.amp.autocast` and `GradScaler` to training.
 - Keep it configurable with a simple boolean switch in config.
 
+Completion notes:
+- Added `training.use_amp` to the training configs.
+- Enabled AMP in both training and validation paths.
+- Verified with a local WSL smoke run on `gpu0`, `batch_size=4`, `num_workers=2`.
+
 ### 3. Freeze ViT by default
+Status: done on 2026-03-24.
 Reason:
 - The code comment says the pretrained ViT is mostly frozen, but the implementation does not actually freeze it.
 - Full ViT training is expensive and unnecessary for a first working baseline.
@@ -28,6 +35,10 @@ Reason:
 Suggested actions:
 - Freeze ViT backbone parameters by default.
 - Only train the projection layer, fusion module, and CAD decoder at first.
+
+Completion notes:
+- Added `model.freeze_vit: true` to the training configs.
+- `ViewEncoder` now freezes the ViT backbone by default while keeping the projection layer trainable.
 
 ## Medium Priority
 

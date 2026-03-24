@@ -5,6 +5,7 @@ model:
   max_seq_len: 120
   n_views: 8
   fusion_type: cross_attention
+  freeze_vit: true
   start_token: 4
 
 training:
@@ -17,6 +18,7 @@ training:
   warmup_epochs: 0
   gradient_clip: 1.0
   num_workers: 2
+  use_amp: true
 
 loss:
   cmd_weight: 1.0

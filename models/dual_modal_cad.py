@@ -30,8 +30,14 @@ class DualModalCADGenerator(nn.Module):
         max_seq_len = self.config['max_seq_len']
         fusion_type = self.config.get('fusion_type', 'gating')
         start_token = self.config.get('start_token', 4)
+        freeze_vit = self.config.get('freeze_vit', True)
+        pretrained_vit = self.config.get('pretrained_vit', True)
 
-        self.view_encoder = ViewEncoder(embed_dim=embed_dim)
+        self.view_encoder = ViewEncoder(
+            embed_dim=embed_dim,
+            pretrained=pretrained_vit,
+            freeze_backbone=freeze_vit,
+        )
         self.multi_view_fusion = MultiViewFusion(
             embed_dim=embed_dim,
             n_views=n_views,
@@ -56,6 +62,8 @@ class DualModalCADGenerator(nn.Module):
             'n_views': 8,
             'fusion_type': 'gating',
             'start_token': 4,
+            'freeze_vit': True,
+            'pretrained_vit': True,
         }
 
     def forward(self, images, text_input_ids, text_attention_mask, tgt_cad_seq=None):

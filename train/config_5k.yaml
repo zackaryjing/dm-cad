@@ -8,6 +8,7 @@ model:
   max_seq_len: 120
   n_views: 8
   fusion_type: cross_attention  # concat, cross_attention, gating
+  freeze_vit: true
 
 training:
   batch_size: 32
@@ -17,6 +18,7 @@ training:
   warmup_epochs: 5
   gradient_clip: 1.0
   num_workers: 4
+  use_amp: true
 
 loss:
   cmd_weight: 1.0

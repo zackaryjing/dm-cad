@@ -25,8 +25,16 @@ class Trainer:
         self.config = config
         self.requested_device = device
         self.device_cfg = config.get('device', {})
+        self.training_cfg = config.get('training', {})
         self.configured_visible_device_count = get_configured_visible_device_count(config)
         self.device = self._resolve_runtime_device(device)
+        self.use_amp = bool(self.training_cfg.get('use_amp', False)) and self.device.type == 'cuda'
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
+        if self.training_cfg.get('use_amp', False) and self.device.type != 'cuda':
+            print('AMP requested but CUDA is not active; running without AMP.')
+        elif self.use_amp:
+            print('AMP mixed precision is enabled for training and evaluation.')
 
         base_model = DualModalCADGenerator(config.get('model', {}))
         self.model = self._wrap_model_for_parallel(base_model)
@@ -122,7 +130,7 @@ class Trainer:
         if n_batches == 0:
             raise ValueError('Training dataloader is empty')
 
-        max_batches = self.config.get('training', {}).get('max_train_batches')
+        max_batches = self.training_cfg.get('max_train_batches')
         effective_batches = min(n_batches, max_batches) if max_batches else n_batches
         pbar = tqdm(dataloader, desc=f'Epoch {self.epoch}', total=effective_batches)
 
@@ -134,22 +142,32 @@ class Trainer:
             cad_seq = batch['cad_seq'].to(self.device, non_blocking=True)
             cad_valid_mask = batch['cad_valid_mask'].to(self.device, non_blocking=True)
 
-            self.optimizer.zero_grad()
-            cmd_logits, param_pred = self.model(
-                images, text_input_ids, text_attention_mask, cad_seq
-            )
+            self.optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                cmd_logits, param_pred = self.model(
+                    images, text_input_ids, text_attention_mask, cad_seq
+                )
 
-            cmd_gt = cad_seq[:, :, 0].long()
-            param_gt = cad_seq[:, :, 1:]
+                cmd_gt = cad_seq[:, :, 0].long()
+                param_gt = cad_seq[:, :, 1:]
 
-            loss, loss_dict = self.criterion(
-                cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
-            )
+                loss, loss_dict = self.criterion(
+                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
+                )
 
-            loss.backward()
-            grad_clip = self.config.get('training', {}).get('gradient_clip', 1.0)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-            self.optimizer.step()
+            grad_clip = self.training_cfg.get('gradient_clip', 1.0)
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                if grad_clip is not None and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                if grad_clip is not None and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                self.optimizer.step()
 
             total_loss += loss.item()
             cmd_loss_total += loss_dict['cmd_loss'].item()
@@ -182,7 +200,7 @@ class Trainer:
         if n_batches == 0:
             raise ValueError('Validation dataloader is empty')
 
-        max_batches = self.config.get('training', {}).get('max_val_batches')
+        max_batches = self.training_cfg.get('max_val_batches')
         effective_batches = min(n_batches, max_batches) if max_batches else n_batches
         processed_batches = 0
 
@@ -193,16 +211,17 @@ class Trainer:
             cad_seq = batch['cad_seq'].to(self.device, non_blocking=True)
             cad_valid_mask = batch['cad_valid_mask'].to(self.device, non_blocking=True)
 
-            cmd_logits, param_pred = self.model(
-                images, text_input_ids, text_attention_mask, cad_seq
-            )
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                cmd_logits, param_pred = self.model(
+                    images, text_input_ids, text_attention_mask, cad_seq
+                )
 
-            cmd_gt = cad_seq[:, :, 0].long()
-            param_gt = cad_seq[:, :, 1:]
+                cmd_gt = cad_seq[:, :, 0].long()
+                param_gt = cad_seq[:, :, 1:]
 
-            loss, _ = self.criterion(
-                cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
-            )
+                loss, _ = self.criterion(
+                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
+                )
             total_loss += loss.item()
             processed_batches += 1
 
