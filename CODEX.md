@@ -209,3 +209,74 @@ At the end of this session:
 - Decide on the final bounded schedule for `train/config_5k_short.yaml`.
 - If this repository needs repeatable CI coverage, convert the current smoke checks into automated tests.
 - Consider adding AMP / mixed precision and profiler-based optimization if training speed remains a bottleneck.
+
+
+## Session 2026-03-24
+
+### Completed Fix
+Files: `runtime_device.py`, `train/train.py`
+
+Commit:
+- `4ecddb8` - `Fix CUDA device mapping for single-GPU training`
+
+Problem:
+- `CUDA_VISIBLE_DEVICES` can remap physical GPUs into local visible indices, but the trainer still trusted `output_device` without validating it against the visible range.
+- If only one CUDA device is visible, the code should not attempt DataParallel setup at all.
+
+Fixes:
+- Added helper logic to count configured visible devices.
+- Validated `output_device` against `torch.cuda.device_count()` and fall back to `cuda:0` if out of range.
+- Disabled `DataParallel` when the config exposes only one visible device.
+- Reused the resolved runtime device index when constructing `nn.DataParallel`.
+
+Why this matters:
+- It removes a common single-GPU misconfiguration path.
+- It makes GPU selection consistent with `CUDA_VISIBLE_DEVICES` remapping.
+- It reduces the chance of parallel wrapper issues after changing config device visibility.
+
+
+## Environment Memory
+- Local test environment (WSL): `/home/jing/allprojects/pythonenvironment/dmcad`
+- Local Python interpreter: `/home/jing/allprojects/pythonenvironment/dmcad/bin/python`
+- Remote SSH environment name: `dmcad`
+- Future convention: if the user says `本地`, use the WSL environment above; if the user says `远端`, activate the remote `dmcad` conda environment before running tests.
+
+
+## Session 2026-03-24 AMP And ViT Freeze
+
+### Completed Work
+Files:
+- `train/train.py`
+- `models/view_encoder.py`
+- `models/dual_modal_cad.py`
+- `train/config.yaml`
+- `train/config_5k.yaml`
+- `train/config_20k.yaml`
+- `train/config_full.yaml`
+- `train/config_5k_short.yaml`
+
+Changes:
+- Added configurable AMP support with `training.use_amp`.
+- Enabled AMP in both training and validation.
+- Added `GradScaler` integration and AMP-safe gradient clipping.
+- Added default ViT backbone freezing in `ViewEncoder`.
+- Propagated `model.freeze_vit` and `model.pretrained_vit` through the main model config.
+- Updated training configs to enable AMP and freeze ViT by default.
+
+### Local WSL Smoke Test
+Environment:
+- Python: `/home/jing/allprojects/pythonenvironment/dmcad/bin/python`
+- GPU visibility: `CUDA_VISIBLE_DEVICES=0`
+- Config: `train/config_5k_short.yaml`
+- Effective settings: single GPU, `batch_size=4`, `num_workers=2`, `use_amp=true`, `freeze_vit=true`
+
+Observed result:
+- Training completed for the bounded 1-epoch short run.
+- Validation completed.
+- Checkpoint saved to `./runs/dmcad/short_5k_baseline/checkpoints/best.pth`.
+- Final log line: `Epoch 0: train_loss=58.6708, val_loss=56.5759, time=24.2s`
+
+Conclusion:
+- The local single-GPU training path is working with AMP enabled.
+- The default-frozen ViT change did not break the training or validation flow.
+- No CUDA OOM or invalid device ordinal error appeared in this smoke test.

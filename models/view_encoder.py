@@ -11,9 +11,9 @@ from timm.models.vision_transformer import vit_base_patch16_224
 class ViewEncoder(nn.Module):
     """单个视图的编码器
 
-    使用预训练的 ViT 作为 backbone，冻结大部分参数
+    使用预训练的 ViT 作为 backbone，默认冻结 backbone 参数
     """
-    def __init__(self, embed_dim=512, pretrained=True):
+    def __init__(self, embed_dim=512, pretrained=True, freeze_backbone=True):
         super().__init__()
         self.vit = vit_base_patch16_224(pretrained=pretrained)
         self.vit.head = nn.Identity()
@@ -23,6 +23,19 @@ class ViewEncoder(nn.Module):
             nn.LayerNorm(embed_dim),
             nn.GELU()
         )
+
+        if freeze_backbone:
+            self.freeze_backbone()
+
+    def freeze_backbone(self):
+        """冻结 ViT backbone，仅保留投影层可训练。"""
+        for param in self.vit.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """解冻 ViT backbone。"""
+        for param in self.vit.parameters():
+            param.requires_grad = True
 
     def forward(self, x):
         """
