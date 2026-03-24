@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from models.dual_modal_cad import DualModalCADGenerator
+from runtime_device import get_configured_visible_device_count
 from train.loss import CADLoss
 
 
@@ -24,6 +25,7 @@ class Trainer:
         self.config = config
         self.requested_device = device
         self.device_cfg = config.get('device', {})
+        self.configured_visible_device_count = get_configured_visible_device_count(config)
         self.device = self._resolve_runtime_device(device)
 
         base_model = DualModalCADGenerator(config.get('model', {}))
@@ -61,7 +63,18 @@ class Trainer:
         if requested_device != 'cuda' or not torch.cuda.is_available():
             return torch.device(requested_device)
 
+        visible_gpu_count = torch.cuda.device_count()
+        if visible_gpu_count == 0:
+            return torch.device('cpu')
+
         output_device = int(self.device_cfg.get('output_device', 0))
+        if output_device < 0 or output_device >= visible_gpu_count:
+            print(
+                f'Configured output_device={output_device} exceeds visible CUDA range [0, {visible_gpu_count - 1}]; '
+                'falling back to cuda:0.'
+            )
+            output_device = 0
+
         return torch.device(f'cuda:{output_device}')
 
     def _wrap_model_for_parallel(self, model):
@@ -73,13 +86,17 @@ class Trainer:
         if not use_data_parallel:
             return model
 
+        if self.configured_visible_device_count is not None and self.configured_visible_device_count <= 1:
+            print('Single visible device configured; disabling DataParallel and using one GPU.')
+            return model
+
         if visible_gpu_count <= 1:
             print('DataParallel requested but fewer than 2 CUDA devices are visible; using single GPU.')
             return model
 
-        output_device = int(self.device_cfg.get('output_device', 0))
+        output_device = self.device.index if self.device.index is not None else 0
         device_ids = list(range(visible_gpu_count))
-        print(f'Enabling DataParallel on visible CUDA devices: {device_ids}')
+        print(f'Enabling DataParallel on visible CUDA devices: {device_ids}, output_device={output_device}')
         return nn.DataParallel(model, device_ids=device_ids, output_device=output_device)
 
     def _model_to_save(self):

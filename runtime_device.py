@@ -19,6 +19,22 @@ def apply_visible_devices(config):
     return visible_str
 
 
+def get_configured_visible_device_count(config):
+    """Return the number of configured visible CUDA devices, if specified."""
+    device_cfg = (config or {}).get('device', {})
+    visible_devices = device_cfg.get('visible_devices')
+    if visible_devices is None:
+        return None
+
+    if isinstance(visible_devices, (list, tuple)):
+        return len(visible_devices)
+
+    visible_str = str(visible_devices).strip()
+    if not visible_str:
+        return 0
+    return len([item for item in visible_str.split(',') if item.strip()])
+
+
 def resolve_device_type(config, cli_device=None):
     """Resolve the requested runtime device."""
     if cli_device:
