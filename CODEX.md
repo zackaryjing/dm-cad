@@ -209,3 +209,27 @@ At the end of this session:
 - Decide on the final bounded schedule for `train/config_5k_short.yaml`.
 - If this repository needs repeatable CI coverage, convert the current smoke checks into automated tests.
 - Consider adding AMP / mixed precision and profiler-based optimization if training speed remains a bottleneck.
+
+
+## Session 2026-03-24
+
+### Completed Fix
+Files: `runtime_device.py`, `train/train.py`
+
+Commit:
+- `4ecddb8` - `Fix CUDA device mapping for single-GPU training`
+
+Problem:
+- `CUDA_VISIBLE_DEVICES` can remap physical GPUs into local visible indices, but the trainer still trusted `output_device` without validating it against the visible range.
+- If only one CUDA device is visible, the code should not attempt DataParallel setup at all.
+
+Fixes:
+- Added helper logic to count configured visible devices.
+- Validated `output_device` against `torch.cuda.device_count()` and fall back to `cuda:0` if out of range.
+- Disabled `DataParallel` when the config exposes only one visible device.
+- Reused the resolved runtime device index when constructing `nn.DataParallel`.
+
+Why this matters:
+- It removes a common single-GPU misconfiguration path.
+- It makes GPU selection consistent with `CUDA_VISIBLE_DEVICES` remapping.
+- It reduces the chance of parallel wrapper issues after changing config device visibility.
