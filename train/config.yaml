@@ -10,13 +10,13 @@ model:
   fusion_type: cross_attention  # concat, cross_attention, gating
 
 training:
-  batch_size: 4
+  batch_size: 20
   num_epochs: 80
   lr: 5.0e-05
   weight_decay: 0.01
   warmup_epochs: 5
   gradient_clip: 1.0
-  num_workers: 2
+  num_workers: 4
 
 loss:
   cmd_weight: 1.0
@@ -47,6 +47,6 @@ log:
 
 device:
   type: cuda
-  visible_devices: [1,2,3]
+  visible_devices: [0]
   use_data_parallel: true
   output_device: 0
