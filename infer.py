@@ -4,15 +4,18 @@
 
 用法:
     python infer.py --checkpoint checkpoints/best.pth --images view_00.png ... view_07.png --text "..."
+    python infer.py --checkpoint checkpoints/best.pth --config train/config_5k.yaml --split test --sample-index 0
 """
 
 import argparse
 
 import torch
+import yaml
 from PIL import Image
 from torchvision import transforms
 from transformers import BertTokenizer
 
+from data.dataset import CADDataset
 from models.dual_modal_cad import DualModalCADGenerator
 
 
@@ -23,10 +26,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Inference with Dual-Modal CAD Generator')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
-    parser.add_argument('--images', type=str, nargs='+', required=True,
+    parser.add_argument('--images', type=str, nargs='+', default=None,
                         help='Paths to 8 view images')
-    parser.add_argument('--text', type=str, required=True,
+    parser.add_argument('--text', type=str, default=None,
                         help='Text description')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Optional config file for dataset-backed sample inference')
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help='Optional data directory override for dataset-backed sample inference')
+    parser.add_argument('--split', type=str, default='test',
+                        help='Dataset split to sample from (default: test)')
+    parser.add_argument('--sample-index', type=int, default=0,
+                        help='Dataset sample index for dataset-backed sample inference (default: 0)')
+    parser.add_argument('--sample-id', type=str, default=None,
+                        help='Specific sample id for dataset-backed sample inference')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use for inference')
     parser.add_argument('--max_steps', type=int, default=120,
@@ -46,29 +59,52 @@ def load_image(img_path, img_size=224):
     return transform(img)
 
 
-def main():
-    args = parse_args()
+def load_config(config_path):
+    if not config_path:
+        return {}
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def resolve_device(device_arg):
+    if device_arg == 'cuda' and not torch.cuda.is_available():
+        print('CUDA not available, using CPU')
+        return 'cpu'
+    return device_arg
+
+
+def _load_state_dict_flexible(model, state_dict):
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError:
+        stripped = {
+            key.replace('module.', '', 1) if key.startswith('module.') else key: value
+            for key, value in state_dict.items()
+        }
+        model.load_state_dict(stripped)
+
+
+def load_model(checkpoint_path, device):
+    print(f'Loading model from {checkpoint_path}...')
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_config = checkpoint.get('config', {}).get('model', checkpoint.get('config', {}))
+    model = DualModalCADGenerator(model_config)
+    _load_state_dict_flexible(model, checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    return model
+
+
+def load_manual_inputs(args):
+    if args.images is None or args.text is None:
+        return None
 
     if len(args.images) != 8:
         raise ValueError(f'Expected 8 view images, got {len(args.images)}')
 
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print('CUDA not available, using CPU')
-        device = 'cpu'
-    else:
-        device = args.device
-
-    print(f'Loading model from {args.checkpoint}...')
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model_config = checkpoint.get('config', {}).get('model', checkpoint.get('config', {}))
-    model = DualModalCADGenerator(model_config)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-
     print(f'Loading {len(args.images)} view images...')
     images = [load_image(img_path) for img_path in args.images]
-    images = torch.stack(images).unsqueeze(0).to(device)
+    images = torch.stack(images).unsqueeze(0)
 
     print(f'Encoding text: "{args.text}"')
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
@@ -79,8 +115,101 @@ def main():
         truncation=True,
         return_tensors='pt'
     )
-    text_input_ids = text_encoding['input_ids'].to(device)
-    text_attention_mask = text_encoding['attention_mask'].to(device)
+
+    return {
+        'sample_id': 'manual_input',
+        'images': images,
+        'text': args.text,
+        'text_input_ids': text_encoding['input_ids'],
+        'text_attention_mask': text_encoding['attention_mask'],
+        'cad_seq': None,
+    }
+
+
+def load_dataset_sample(args, config):
+    data_cfg = config.get('data', {})
+    data_root = args.data_dir or data_cfg.get('data_root')
+    if not data_root:
+        raise ValueError('Dataset-backed inference requires --config or --data_dir')
+
+    ids_file = data_cfg.get(f'{args.split}_ids_file')
+    if ids_file is None and args.split == 'test':
+        ids_file = data_cfg.get('test_ids_file')
+
+    dataset = CADDataset(
+        data_root=data_root,
+        split=args.split,
+        ids_file=ids_file,
+        img_size=data_cfg.get('img_size', 224),
+        text_max_len=data_cfg.get('text_max_len', 64),
+    )
+    if len(dataset) == 0:
+        raise ValueError(f'No samples found for split={args.split}, ids_file={ids_file}')
+
+    if args.sample_id is not None:
+        try:
+            sample_index = dataset.data_list.index(args.sample_id)
+        except ValueError as exc:
+            raise ValueError(f'Sample id not found in dataset split: {args.sample_id}') from exc
+    else:
+        sample_index = args.sample_index
+
+    if sample_index < 0 or sample_index >= len(dataset):
+        raise IndexError(f'sample-index {sample_index} out of range [0, {len(dataset) - 1}]')
+
+    sample = dataset[sample_index]
+    print(f'Loaded dataset sample {sample["sample_id"]} from split={args.split} (index={sample_index})')
+    if ids_file:
+        print(f'Using ids file: {ids_file}')
+    return {
+        'sample_id': sample['sample_id'],
+        'images': sample['images'].unsqueeze(0),
+        'text': sample['text'],
+        'text_input_ids': sample['text_input_ids'].unsqueeze(0),
+        'text_attention_mask': sample['text_attention_mask'].unsqueeze(0),
+        'cad_seq': sample['cad_seq'],
+    }
+
+
+def format_step(cmd_type, params):
+    cmd_name = CMD_NAMES[cmd_type] if 0 <= cmd_type < len(CMD_NAMES) else f'CMD_{cmd_type}'
+    params_np = params.numpy()
+    return f'{cmd_name}, params: {params_np[:5]}...'
+
+
+def print_sequence(title, cmd_tensor, param_tensor):
+    print(f'\n=== {title} ===')
+    for step in range(cmd_tensor.shape[0]):
+        cmd_type = int(cmd_tensor[step].item())
+        print(f'Step {step}: {format_step(cmd_type, param_tensor[step].cpu())}')
+        if cmd_type == 3:
+            break
+
+
+def print_ground_truth(cad_seq):
+    if cad_seq is None or cad_seq.shape[0] == 0:
+        return
+
+    gt_cmd = cad_seq[:, 0].long().clamp(min=0).cpu()
+    gt_param = cad_seq[:, 1:].cpu()
+    print_sequence('Ground Truth CAD Sequence', gt_cmd, gt_param)
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+    device = resolve_device(args.device)
+    model = load_model(args.checkpoint, device)
+
+    sample = load_manual_inputs(args)
+    if sample is None:
+        sample = load_dataset_sample(args, config)
+
+    print(f'Text: "{sample["text"]}"')
+
+    images = sample['images'].to(device)
+    text_input_ids = sample['text_input_ids'].to(device)
+    text_attention_mask = sample['text_attention_mask'].to(device)
 
     print('Generating CAD sequence...')
     with torch.no_grad():
@@ -91,17 +220,9 @@ def main():
             max_steps=args.max_steps
         )
 
-    print('\n=== Generated CAD Sequence ===')
-    cmd_seq = cmd_pred[0].cpu()
-    param_seq = param_pred[0].cpu()
-    for step in range(cmd_seq.shape[0]):
-        cmd_type = int(cmd_seq[step].item())
-        cmd_name = CMD_NAMES[cmd_type] if 0 <= cmd_type < len(CMD_NAMES) else f'CMD_{cmd_type}'
-        params_np = param_seq[step].numpy()
-        print(f'Step {step}: {cmd_name}, params: {params_np[:5]}...')
-        if cmd_type == 3:
-            break
-
+    print(f'\nSample ID: {sample["sample_id"]}')
+    print_sequence('Generated CAD Sequence', cmd_pred[0].cpu(), param_pred[0].cpu())
+    print_ground_truth(sample['cad_seq'])
     print('\nGeneration completed!')
 
 
