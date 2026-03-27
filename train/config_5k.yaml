@@ -37,7 +37,7 @@ scheduler:
 data:
   img_size: 224
   text_max_len: 64
-  data_root: datasets/dataset_v0
+  data_root: datasets/dataset_v1
   train_ids_file: train_ids_5k.txt
   test_ids_file: test_ids_5k.txt
 
