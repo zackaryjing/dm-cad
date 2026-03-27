@@ -11,14 +11,13 @@ model:
   freeze_vit: true
 
 training:
-  batch_size: 16
-  num_epochs: 80
+  batch_size: 192
+  num_epochs: 200
   lr: 5.0e-05
   weight_decay: 0.01
   warmup_epochs: 5
   gradient_clip: 1.0
   num_workers: 4
-  num_workers: 2
   use_amp: true
 
 loss:
