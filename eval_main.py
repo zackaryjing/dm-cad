@@ -8,6 +8,8 @@
 """
 
 import argparse
+from datetime import datetime
+from pathlib import Path
 
 import yaml
 
@@ -31,7 +33,9 @@ def parse_args():
     parser.add_argument('--device', type=str, default=None,
                         help='Optional device override, e.g. cuda or cpu')
     parser.add_argument('--output', type=str, default=None,
-                        help='Path to save generated sequences')
+                        help='Optional path to save generated sequences; relative paths are resolved under the run eval directory')
+    parser.add_argument('--metrics_output', type=str, default=None,
+                        help='Optional path to save evaluation metrics; relative paths are resolved under the run eval directory')
     return parser.parse_args()
 
 
@@ -44,6 +48,46 @@ def _load_state_dict_flexible(model, state_dict):
             for key, value in state_dict.items()
         }
         model.load_state_dict(stripped)
+
+
+def _resolve_run_eval_dir(checkpoint_path):
+    checkpoint_path = Path(checkpoint_path).resolve()
+    run_dir = checkpoint_path.parent.parent
+    eval_dir = run_dir / 'eval'
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir, eval_dir
+
+
+def _resolve_output_path(path_value, eval_dir):
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = eval_dir / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _default_metrics_path(checkpoint_path, split, eval_dir):
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    checkpoint_stem = Path(checkpoint_path).stem
+    return eval_dir / f'{checkpoint_stem}_{split}_{timestamp}.metrics.yaml'
+
+
+def _save_metrics(metrics, metrics_path, args, data_root, ids_file):
+    payload = {
+        'checkpoint': args.checkpoint,
+        'config': args.config,
+        'data_dir': data_root,
+        'split': args.split,
+        'ids_file': ids_file,
+        'batch_size': args.batch_size,
+        'max_batches': args.max_batches,
+        'device': args.device,
+        'metrics': metrics,
+    }
+    with metrics_path.open('w') as f:
+        yaml.safe_dump(payload, f, sort_keys=False)
 
 
 def main():
@@ -75,6 +119,12 @@ def main():
     if visible_devices:
         print(f'Using CUDA_VISIBLE_DEVICES={visible_devices}')
 
+    run_dir, eval_dir = _resolve_run_eval_dir(args.checkpoint)
+    metrics_output_path = _resolve_output_path(args.metrics_output, eval_dir)
+    if metrics_output_path is None:
+        metrics_output_path = _default_metrics_path(args.checkpoint, args.split, eval_dir)
+    generated_output_path = _resolve_output_path(args.output, eval_dir)
+
     print(f'Loading model from {args.checkpoint}...')
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model_config = checkpoint.get('config', {}).get('model', checkpoint.get('config', {}))
@@ -90,6 +140,8 @@ def main():
     if ids_file is None and args.split == 'test':
         ids_file = data_cfg.get('test_ids_file')
 
+    print(f'Run directory: {run_dir}')
+    print(f'Evaluation outputs directory: {eval_dir}')
     print(f'Loading {args.split} data from {data_root}...')
     test_loader = build_dataloader(
         data_root=data_root,
@@ -115,9 +167,12 @@ def main():
     for name, value in metrics.items():
         print(f'{name}: {value:.4f}')
 
-    if args.output:
-        print(f'Saving generated sequences to {args.output}...')
-        evaluator.generate_and_save(test_loader, args.output, max_batches=max_batches)
+    _save_metrics(metrics, metrics_output_path, args, data_root, ids_file)
+    print(f'Saved metrics to {metrics_output_path}')
+
+    if generated_output_path:
+        print(f'Saving generated sequences to {generated_output_path}...')
+        evaluator.generate_and_save(test_loader, str(generated_output_path), max_batches=max_batches)
 
     print('Evaluation completed!')
 

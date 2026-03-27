@@ -50,11 +50,11 @@ conda activate /home/jing/allprojects/pythonenvironment/dmcad
 ## 训练
 
 ```bash
-# 使用默认配置训练 (data_root 从 config.yaml 读取)
+# 使用默认配置训练 (会自动创建独立的 run 目录)
 python train_main.py --config train/config.yaml
 
-# 从检查点恢复训练
-python train_main.py --config train/config.yaml --resume checkpoints/epoch_10.pth
+# 从检查点恢复训练 (继续写入该 checkpoint 所在的 run 目录)
+python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/checkpoints/epoch_10.pth
 ```
 
 **配置说明** (`train/config.yaml`):
@@ -66,7 +66,11 @@ python train_main.py --config train/config.yaml --resume checkpoints/epoch_10.pt
 
 ```bash
 # 在测试集上评估
+# 默认会把 metrics 保存到该 checkpoint 所在 run 目录下的 eval/ 子目录
 python eval_main.py --checkpoint checkpoints/best.pth
+
+# 相对 --output/--metrics_output 也会默认解析到该 run 的 eval/ 子目录
+python eval_main.py     --checkpoint checkpoints/best.pth     --output generated.pt     --metrics_output metrics.yaml
 ```
 
 ## 推理
