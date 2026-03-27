@@ -72,11 +72,11 @@ python eval_main.py --checkpoint checkpoints/best.pth
 ## 推理
 
 ```bash
-# 使用 8 视图图像和文本描述生成 CAD 序列
-python infer.py \
-    --checkpoint checkpoints/best.pth \
-    --images view_00.png view_01.png ... view_07.png \
-    --text "A rectangular box with a cylindrical hole through the center"
+# 方式 1：使用 8 视图图像和文本描述生成 CAD 序列
+python infer.py     --checkpoint checkpoints/best.pth     --images view_00.png view_01.png ... view_07.png     --text "A rectangular box with a cylindrical hole through the center"
+
+# 方式 2：直接从配置里的 test_ids 中选一个测试样本跑推理
+python infer.py     --checkpoint checkpoints/best.pth     --config train/config_5k.yaml     --split test     --sample-index 0     --device cuda
 ```
 
 ## 模型架构
@@ -94,7 +94,7 @@ python infer.py \
 │       ↓                         ↓                           │
 │     z_img [512]            z_txt [512]                      │
 │              ↓               ↓                              │
-│         Modal Fusion (Cross-Attention)                      │
+│         Modal Fusion (Gating)                      │
 │                    ↓                                        │
 │              z_fused [512]                                  │
 │                    ↓                                        │

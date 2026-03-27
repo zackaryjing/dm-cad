@@ -25,7 +25,7 @@ model:
   n_layers: 6
   max_seq_len: 120
   n_views: 8
-  fusion_type: cross_attention
+  fusion_type: gating
   start_token: 4
 
 training:
@@ -60,7 +60,6 @@ data:
 
 log:
   log_dir: ./runs/dmcad/$RUN_NAME
-  save_dir: ./runs/dmcad/$RUN_NAME/checkpoints
   print_freq: 1
   val_freq: 1
 EOF2

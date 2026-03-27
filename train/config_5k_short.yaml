@@ -4,7 +4,7 @@ model:
   n_layers: 6
   max_seq_len: 120
   n_views: 8
-  fusion_type: cross_attention
+  fusion_type: gating
   freeze_vit: true
   start_token: 4
 
@@ -43,7 +43,6 @@ data:
 
 log:
   log_dir: ./runs/dmcad/short_5k_baseline
-  save_dir: ./runs/dmcad/short_5k_baseline/checkpoints
   print_freq: 10
   val_freq: 1
 
