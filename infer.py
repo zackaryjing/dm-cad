@@ -5,9 +5,11 @@
 用法:
     python infer.py --checkpoint checkpoints/best.pth --images view_00.png ... view_07.png --text "..."
     python infer.py --checkpoint checkpoints/best.pth --config train/config_5k.yaml --split test --sample-index 0
+    python infer.py --checkpoint checkpoints/best.pth --config train/config_5k.yaml --sample-ids-file sample_ids.txt
 """
 
 import argparse
+from pathlib import Path
 
 import torch
 import yaml
@@ -40,6 +42,8 @@ def parse_args():
                         help='Dataset sample index for dataset-backed sample inference (default: 0)')
     parser.add_argument('--sample-id', type=str, default=None,
                         help='Specific sample id for dataset-backed sample inference')
+    parser.add_argument('--sample-ids-file', type=str, default=None,
+                        help='Path to a text file containing one sample id per line for batch sample inference')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use for inference')
     parser.add_argument('--max_steps', type=int, default=120,
@@ -116,17 +120,17 @@ def load_manual_inputs(args):
         return_tensors='pt'
     )
 
-    return {
+    return [{
         'sample_id': 'manual_input',
         'images': images,
         'text': args.text,
         'text_input_ids': text_encoding['input_ids'],
         'text_attention_mask': text_encoding['attention_mask'],
         'cad_seq': None,
-    }
+    }]
 
 
-def load_dataset_sample(args, config):
+def build_dataset(args, config):
     data_cfg = config.get('data', {})
     data_root = args.data_dir or data_cfg.get('data_root')
     if not data_root:
@@ -146,6 +150,46 @@ def load_dataset_sample(args, config):
     if len(dataset) == 0:
         raise ValueError(f'No samples found for split={args.split}, ids_file={ids_file}')
 
+    print(f'Loaded dataset split={args.split} with {len(dataset)} samples')
+    if ids_file:
+        print(f'Using ids file: {ids_file}')
+    return dataset
+
+
+def sample_from_dataset(dataset, sample_index):
+    sample = dataset[sample_index]
+    return {
+        'sample_id': sample['sample_id'],
+        'images': sample['images'].unsqueeze(0),
+        'text': sample['text'],
+        'text_input_ids': sample['text_input_ids'].unsqueeze(0),
+        'text_attention_mask': sample['text_attention_mask'].unsqueeze(0),
+        'cad_seq': sample['cad_seq'],
+    }
+
+
+def load_sample_ids(sample_ids_file):
+    with open(sample_ids_file, 'r') as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def load_dataset_samples(args, config):
+    dataset = build_dataset(args, config)
+
+    if args.sample_ids_file:
+        requested_ids = load_sample_ids(args.sample_ids_file)
+        if not requested_ids:
+            raise ValueError(f'No sample ids found in {args.sample_ids_file}')
+        dataset_index = {sample_id: idx for idx, sample_id in enumerate(dataset.data_list)}
+        samples = []
+        for sample_id in requested_ids:
+            if sample_id not in dataset_index:
+                raise ValueError(f'Sample id not found in dataset split: {sample_id}')
+            sample_index = dataset_index[sample_id]
+            samples.append(sample_from_dataset(dataset, sample_index))
+        print(f'Loaded {len(samples)} samples from {args.sample_ids_file}')
+        return samples
+
     if args.sample_id is not None:
         try:
             sample_index = dataset.data_list.index(args.sample_id)
@@ -157,18 +201,8 @@ def load_dataset_sample(args, config):
     if sample_index < 0 or sample_index >= len(dataset):
         raise IndexError(f'sample-index {sample_index} out of range [0, {len(dataset) - 1}]')
 
-    sample = dataset[sample_index]
-    print(f'Loaded dataset sample {sample["sample_id"]} from split={args.split} (index={sample_index})')
-    if ids_file:
-        print(f'Using ids file: {ids_file}')
-    return {
-        'sample_id': sample['sample_id'],
-        'images': sample['images'].unsqueeze(0),
-        'text': sample['text'],
-        'text_input_ids': sample['text_input_ids'].unsqueeze(0),
-        'text_attention_mask': sample['text_attention_mask'].unsqueeze(0),
-        'cad_seq': sample['cad_seq'],
-    }
+    print(f'Loaded dataset sample {dataset.data_list[sample_index]} from split={args.split} (index={sample_index})')
+    return [sample_from_dataset(dataset, sample_index)]
 
 
 def format_step(cmd_type, params):
@@ -195,16 +229,8 @@ def print_ground_truth(cad_seq):
     print_sequence('Ground Truth CAD Sequence', gt_cmd, gt_param)
 
 
-def main():
-    args = parse_args()
-    config = load_config(args.config)
-    device = resolve_device(args.device)
-    model = load_model(args.checkpoint, device)
-
-    sample = load_manual_inputs(args)
-    if sample is None:
-        sample = load_dataset_sample(args, config)
-
+def run_inference(model, sample, device, max_steps):
+    print(f'\nSample ID: {sample["sample_id"]}')
     print(f'Text: "{sample["text"]}"')
 
     images = sample['images'].to(device)
@@ -217,12 +243,29 @@ def main():
             images,
             text_input_ids,
             text_attention_mask,
-            max_steps=args.max_steps
+            max_steps=max_steps
         )
 
-    print(f'\nSample ID: {sample["sample_id"]}')
     print_sequence('Generated CAD Sequence', cmd_pred[0].cpu(), param_pred[0].cpu())
     print_ground_truth(sample['cad_seq'])
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+    device = resolve_device(args.device)
+    model = load_model(args.checkpoint, device)
+
+    samples = load_manual_inputs(args)
+    if samples is None:
+        samples = load_dataset_samples(args, config)
+
+    total_samples = len(samples)
+    for idx, sample in enumerate(samples, start=1):
+        if total_samples > 1:
+            print('\n' + '=' * 24 + f' Sample {idx}/{total_samples} ' + '=' * 24)
+        run_inference(model, sample, device, args.max_steps)
+
     print('\nGeneration completed!')
 
 
