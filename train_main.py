@@ -95,6 +95,8 @@ def main():
     data_root = data_cfg.get('data_root')
     if not data_root:
         raise ValueError('data_root not specified in config file')
+    data_backend = data_cfg.get('backend', 'files')
+    lmdb_path = data_cfg.get('lmdb_path')
 
     requested_device = resolve_device_type(config, args.device)
     if requested_device == 'cuda' and not torch.cuda.is_available():
@@ -114,6 +116,9 @@ def main():
         trainer.load_checkpoint(args.resume)
 
     print(f'Loading training data from {data_root}...')
+    print(f'  Dataset backend: {data_backend}')
+    if data_backend == 'lmdb':
+        print(f'  LMDB path: {lmdb_path or "cad_data.lmdb"}')
     train_ids_file = data_cfg.get('train_ids_file')
     train_loader = build_dataloader(
         data_root=data_root,
@@ -123,12 +128,17 @@ def main():
         ids_file=train_ids_file,
         img_size=data_cfg.get('img_size', 224),
         text_max_len=data_cfg.get('text_max_len', 64),
+        backend=data_cfg.get('backend', 'files'),
+        lmdb_path=data_cfg.get('lmdb_path'),
     )
     if train_ids_file:
         print(f'  Using ids file: {train_ids_file}')
     print(f'  Loaded {len(train_loader.dataset)} samples')
 
     print(f'Loading validation data from {data_root}...')
+    print(f'  Dataset backend: {data_backend}')
+    if data_backend == 'lmdb':
+        print(f'  LMDB path: {lmdb_path or "cad_data.lmdb"}')
     test_ids_file = data_cfg.get('test_ids_file')
     val_loader = build_dataloader(
         data_root=data_root,
@@ -138,6 +148,8 @@ def main():
         ids_file=test_ids_file,
         img_size=data_cfg.get('img_size', 224),
         text_max_len=data_cfg.get('text_max_len', 64),
+        backend=data_cfg.get('backend', 'files'),
+        lmdb_path=data_cfg.get('lmdb_path'),
     )
     if test_ids_file:
         print(f'  Using ids file: {test_ids_file}')

@@ -5,11 +5,12 @@
 
 import os
 import time
+import math
 
 import torch
 from torch import nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -43,22 +44,30 @@ class Trainer:
         loss_cfg = config.get('loss', {})
         self.criterion = CADLoss(
             cmd_weight=loss_cfg.get('cmd_weight', 1.0),
-            param_weight=loss_cfg.get('param_weight', 0.5)
+            eos_weight=loss_cfg.get('eos_weight', 0.5),
+            param_weight=loss_cfg.get('param_weight', 0.5),
+            use_cmd_mask=loss_cfg.get('use_cmd_mask', True),
+            eos_token_id=loss_cfg.get('eos_token_id', 3),
+            label_smoothing=loss_cfg.get('label_smoothing', 0.05),
+            class_weights=loss_cfg.get('class_weights'),
+            param_scale=loss_cfg.get('param_scale', 1.0),
+            param_curriculum_start=loss_cfg.get('param_curriculum_start', 0.1),
+            param_curriculum_end=loss_cfg.get('param_curriculum_end', 0.6),
+            param_loss_cap=loss_cfg.get('param_loss_cap', 1.0),
         ).to(self.device)
 
         optimizer_cfg = config.get('optimizer', {})
+        base_lr = optimizer_cfg.get('lr', self.training_cfg.get('lr', 5e-5))
         self.optimizer = AdamW(
             self.model.parameters(),
-            lr=optimizer_cfg.get('lr', 5e-5),
+            lr=base_lr,
             weight_decay=optimizer_cfg.get('weight_decay', 0.01)
         )
 
         scheduler_cfg = config.get('scheduler', {})
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=scheduler_cfg.get('T_max', 80),
-            eta_min=scheduler_cfg.get('eta_min', 1e-6)
-        )
+        self.lr_lambda = self._build_lr_lambda(scheduler_cfg)
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda=self.lr_lambda)
+        self._apply_lr_factor(0)
 
         self.epoch = 0
         self.best_val_loss = float('inf')
@@ -66,6 +75,34 @@ class Trainer:
         log_cfg = config.get('log', {})
         self.log_dir = log_cfg.get('log_dir', config.get('log_dir', 'runs/dmcad'))
         self.writer = SummaryWriter(self.log_dir)
+
+    def _build_lr_lambda(self, scheduler_cfg):
+        warmup_epochs = max(int(self.training_cfg.get('warmup_epochs', 0)), 0)
+        total_epochs = max(int(self.training_cfg.get('num_epochs', scheduler_cfg.get('T_max', 1))), 1)
+        eta_min = float(scheduler_cfg.get('eta_min', 1e-6))
+        base_lr = float(self.optimizer.param_groups[0]['lr'])
+        min_lr_ratio = min(max(eta_min / max(base_lr, 1e-12), 0.0), 1.0)
+
+        def lr_lambda(epoch):
+            if warmup_epochs > 0 and epoch < warmup_epochs:
+                return max((epoch + 1) / warmup_epochs, min_lr_ratio)
+
+            cosine_span = max(total_epochs - warmup_epochs, 1)
+            cosine_epoch = min(max(epoch - warmup_epochs, 0), cosine_span)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * cosine_epoch / cosine_span))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        return lr_lambda
+
+    def _training_progress(self, batch_idx, total_batches):
+        total_epochs = max(int(self.training_cfg.get('num_epochs', 1)), 1)
+        epoch_progress = (batch_idx + 1) / max(total_batches, 1)
+        return min((self.epoch + epoch_progress) / total_epochs, 1.0)
+
+    def _apply_lr_factor(self, epoch):
+        factor = self.lr_lambda(epoch)
+        for group, base_lr in zip(self.optimizer.param_groups, self.scheduler.base_lrs):
+            group['lr'] = base_lr * factor
 
     def _resolve_runtime_device(self, requested_device):
         if requested_device != 'cuda' or not torch.cuda.is_available():
@@ -125,6 +162,7 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         cmd_loss_total = 0.0
+        eos_loss_total = 0.0
         param_loss_total = 0.0
         n_batches = len(dataloader)
         if n_batches == 0:
@@ -135,7 +173,8 @@ class Trainer:
         pbar = tqdm(dataloader, desc=f'Epoch {self.epoch}', total=effective_batches)
 
         processed_batches = 0
-        for batch in pbar:
+        skipped_batches = 0
+        for batch_idx, batch in enumerate(pbar):
             images = batch['images'].to(self.device, non_blocking=True)
             text_input_ids = batch['text_input_ids'].to(self.device, non_blocking=True)
             text_attention_mask = batch['text_attention_mask'].to(self.device, non_blocking=True)
@@ -150,10 +189,17 @@ class Trainer:
 
                 cmd_gt = cad_seq[:, :, 0].long()
                 param_gt = cad_seq[:, :, 1:]
+                progress = self._training_progress(batch_idx, effective_batches)
 
                 loss, loss_dict = self.criterion(
-                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
+                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask, progress=progress
                 )
+
+            if not torch.isfinite(loss):
+                skipped_batches += 1
+                self.optimizer.zero_grad(set_to_none=True)
+                pbar.set_postfix({'loss': 'non-finite', 'skipped': skipped_batches})
+                continue
 
             grad_clip = self.training_cfg.get('gradient_clip', 1.0)
             if self.use_amp:
@@ -171,22 +217,31 @@ class Trainer:
 
             total_loss += loss.item()
             cmd_loss_total += loss_dict['cmd_loss'].item()
+            eos_loss_total += loss_dict['eos_loss'].item()
             param_loss_total += loss_dict['param_loss'].item()
             processed_batches += 1
 
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'cmd': f'{loss_dict["cmd_loss"].item():.4f}',
-                'param': f'{loss_dict["param_loss"].item():.4f}'
+                'eos': f'{loss_dict["eos_loss"].item():.4f}',
+                'param': f'{loss_dict["param_loss"].item():.4f}',
+                'pw': f'{loss_dict["param_weight"].item():.3f}'
             })
 
             if max_batches and processed_batches >= max_batches:
                 break
 
+        if processed_batches == 0:
+            raise RuntimeError(f'No valid training batches were processed; skipped_batches={skipped_batches}')
+
         return {
             'loss': total_loss / processed_batches,
             'cmd_loss': cmd_loss_total / processed_batches,
-            'param_loss': param_loss_total / processed_batches
+            'eos_loss': eos_loss_total / processed_batches,
+            'param_loss': param_loss_total / processed_batches,
+            'skipped_batches': skipped_batches,
+            'lr': self.optimizer.param_groups[0]['lr']
         }
 
     @torch.no_grad()
@@ -220,7 +275,7 @@ class Trainer:
                 param_gt = cad_seq[:, :, 1:]
 
                 loss, _ = self.criterion(
-                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask
+                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask, progress=1.0
                 )
             total_loss += loss.item()
             processed_batches += 1
@@ -231,8 +286,11 @@ class Trainer:
                 cmd_acc_total += cmd_correct.item()
 
                 param_error = torch.abs(param_pred - param_gt)
-                param_correct = (param_error < 0.1)[cad_valid_mask].float().mean()
-                param_acc_total += param_correct.item()
+                cmd_mask = self.criterion.cmd_param_mask.to(param_error.device)[cmd_gt.clamp(min=0, max=self.criterion.cmd_param_mask.shape[0] - 1)]
+                combined_mask = cad_valid_mask.unsqueeze(-1) & cmd_mask
+                if combined_mask.any():
+                    param_correct = (param_error < 0.1)[combined_mask].float().mean()
+                    param_acc_total += param_correct.item()
 
             if max_batches and processed_batches >= max_batches:
                 break
@@ -247,6 +305,8 @@ class Trainer:
         """完整训练循环"""
         for epoch in range(self.epoch, num_epochs):
             self.epoch = epoch
+            self._apply_lr_factor(epoch)
+            self.scheduler.last_epoch = epoch
             start_time = time.time()
 
             train_metrics = self.train_one_epoch(train_loader)
@@ -259,8 +319,6 @@ class Trainer:
 
             if (epoch + 1) % 10 == 0:
                 self.save_checkpoint(f'epoch_{epoch + 1}.pth')
-
-            self.scheduler.step()
 
             elapsed = time.time() - start_time
             print(f'Epoch {epoch}: train_loss={train_metrics["loss"]:.4f}, '

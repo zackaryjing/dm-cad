@@ -151,6 +151,8 @@ def main():
         ids_file=ids_file,
         img_size=data_cfg.get('img_size', 224),
         text_max_len=data_cfg.get('text_max_len', 64),
+        backend=data_cfg.get('backend', 'files'),
+        lmdb_path=data_cfg.get('lmdb_path'),
     )
     if ids_file:
         print(f'  Using ids file: {ids_file}')

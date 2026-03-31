@@ -3,14 +3,20 @@
 CAD 数据集类 - 实现双模态 CAD 数据加载
 基于设计文档 5.3 节
 
+支持两种后端：
+- files: 原始散文件目录
+- lmdb: 单库 KV 读取，减少大量随机小文件 I/O
+
 目录结构适配:
 - 图像：cad_img/{group_id}/{sample_name}/{sample_name}_{000-007}.png
 - 文本：cad_desc/{group_id}.json (按 id 字段查找)
 - CAD: cad_vec/{group_id}/{sample_name}.h5
 """
 
+import io
 import json
 import os
+import pickle
 
 import h5py
 import numpy as np
@@ -20,19 +26,145 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import BertTokenizer
 
+try:
+    import lmdb
+except ImportError:
+    lmdb = None
+
+
+DEFAULT_LMDB_FILENAME = 'cad_data.lmdb'
+
+
+def resolve_ids_path(data_root, split='train', ids_file=None):
+    """解析 ids 文件路径。"""
+    if ids_file is not None:
+        if os.path.isabs(ids_file):
+            return ids_file
+        return os.path.join(data_root, ids_file)
+    return os.path.join(data_root, f'{split}_ids.txt')
+
+
+def load_ids_list(data_root, split='train', ids_file=None):
+    """加载样本 ID 列表。"""
+    ids_path = resolve_ids_path(data_root, split=split, ids_file=ids_file)
+    if os.path.exists(ids_path):
+        with open(ids_path, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+
+    print(f'Warning: ids file not found: {ids_path}')
+    return []
+
+
+def _normalize_cad_array(data):
+    """将 CAD 向量规整为 [seq_len, 20] float32。"""
+    if len(data.shape) == 1:
+        data = data.reshape(-1, 17)
+
+    if data.shape[1] == 17:
+        padded = np.zeros((data.shape[0], 20), dtype=np.float32)
+        padded[:, :17] = data.astype(np.float32)
+        data = padded
+    elif data.shape[1] != 20:
+        raise ValueError(f'Unexpected CAD vector shape: {data.shape}')
+    else:
+        data = data.astype(np.float32, copy=False)
+
+    return data
+
+
+def load_cad_array_from_h5(vec_path):
+    """从 h5 读取 CAD 向量。"""
+    with h5py.File(vec_path, 'r') as f:
+        for key in ['cad_seq', 'sequence', 'data', 'vec']:
+            if key in f:
+                data = f[key][:]
+                break
+        else:
+            key = list(f.keys())[0]
+            data = f[key][:]
+    return _normalize_cad_array(data)
+
+
+def load_cad_array_from_files(data_root, group_id, sample_name):
+    """从散文件目录加载 CAD 向量。"""
+    vec_path = os.path.join(data_root, 'cad_vec', group_id, f'{sample_name}.h5')
+    if os.path.exists(vec_path):
+        try:
+            return load_cad_array_from_h5(vec_path)
+        except Exception as e:
+            print(f'Warning: Failed to load CAD vector {vec_path}: {e}')
+
+    return np.zeros((0, 20), dtype=np.float32)
+
+
+def load_image_bytes_from_files(data_root, group_id, sample_name, n_views=8):
+    """从散文件目录读取多视图原始 PNG bytes。"""
+    img_dir = os.path.join(data_root, 'cad_img', group_id, sample_name)
+    image_bytes = []
+    for i in range(n_views):
+        img_path = os.path.join(img_dir, f'{sample_name}_{i:03d}.png')
+        if os.path.exists(img_path):
+            with open(img_path, 'rb') as f:
+                image_bytes.append(f.read())
+        else:
+            image_bytes.append(None)
+    return image_bytes
+
+
+def preload_text_descriptions(data_root, sample_ids):
+    """预加载所需 group 的文本描述。"""
+    needed_groups = set()
+    for sample_id in sample_ids:
+        parts = sample_id.split('/')
+        if len(parts) >= 2:
+            needed_groups.add(parts[0])
+
+    text_cache = {}
+    for group_id in needed_groups:
+        desc_file = os.path.join(data_root, 'cad_desc', f'{group_id}.json')
+        if os.path.exists(desc_file):
+            with open(desc_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            text_cache[group_id] = {
+                entry['id']: entry.get('text caption', '')
+                for entry in data if 'id' in entry
+            }
+        else:
+            text_cache[group_id] = {}
+    return text_cache
+
+
+def resolve_lmdb_path(data_root, lmdb_path=None):
+    """解析 LMDB 路径。"""
+    if lmdb_path is None:
+        return os.path.join(data_root, DEFAULT_LMDB_FILENAME)
+    if os.path.isabs(lmdb_path):
+        return lmdb_path
+    return os.path.join(data_root, lmdb_path)
+
 
 class CADDataset(Dataset):
-    """双模态 CAD 数据集
+    """双模态 CAD 数据集。"""
 
-    加载图像、文本和 CAD 序列三元组数据
-    """
-    def __init__(self, data_root, split='train', img_size=224,
-                 text_max_len=64, tokenizer_name='bert-base-uncased',
-                 ids_file=None):
+    def __init__(
+        self,
+        data_root,
+        split='train',
+        img_size=224,
+        text_max_len=64,
+        tokenizer_name='bert-base-uncased',
+        ids_file=None,
+        backend='files',
+        lmdb_path=None,
+        lmdb_readers=128,
+    ):
         self.data_root = data_root
         self.split = split
         self.img_size = img_size
         self.text_max_len = text_max_len
+        self.backend = backend
+        self.lmdb_readers = lmdb_readers
+        self.n_views = 8
 
         self.image_transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
@@ -42,46 +174,41 @@ class CADDataset(Dataset):
         ])
 
         self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+        self.data_list = load_ids_list(data_root, split=split, ids_file=ids_file)
         self.text_cache = {}
-        self.data_list = self._load_data_list(ids_file)
-        self._preload_text_descriptions()
+        self._lmdb_env = None
+        self._lmdb_txn = None
+        self._lmdb_path = None
 
-    def _load_data_list(self, ids_file):
-        """加载数据索引"""
-        if ids_file is not None:
-            if os.path.isabs(ids_file):
-                ids_path = ids_file
-            else:
-                ids_path = os.path.join(self.data_root, ids_file)
+        self.backend = self._resolve_backend(backend, lmdb_path)
+        if self.backend == 'files':
+            self.text_cache = preload_text_descriptions(self.data_root, self.data_list)
+        elif self.backend == 'lmdb':
+            self._lmdb_path = resolve_lmdb_path(self.data_root, lmdb_path)
+            self._validate_lmdb_available()
         else:
-            ids_path = os.path.join(self.data_root, f'{self.split}_ids.txt')
+            raise ValueError(f'Unsupported dataset backend: {self.backend}')
 
-        if os.path.exists(ids_path):
-            with open(ids_path, 'r') as f:
-                return [line.strip() for line in f if line.strip()]
+    def _resolve_backend(self, backend, lmdb_path):
+        if backend != 'auto':
+            return backend
 
-        print(f'Warning: ids file not found: {ids_path}')
-        return []
+        resolved_lmdb_path = resolve_lmdb_path(self.data_root, lmdb_path)
+        if os.path.exists(resolved_lmdb_path):
+            return 'lmdb'
+        return 'files'
 
-    def _preload_text_descriptions(self):
-        """预加载所有需要的文本描述到缓存"""
-        needed_groups = set()
-        for sample_id in self.data_list:
-            parts = sample_id.split('/')
-            if len(parts) >= 2:
-                needed_groups.add(parts[0])
+    def _validate_lmdb_available(self):
+        if lmdb is None:
+            raise ImportError('lmdb is required for backend="lmdb". Please install lmdb first.')
+        if not os.path.exists(self._lmdb_path):
+            raise FileNotFoundError(f'LMDB path not found: {self._lmdb_path}')
 
-        for group_id in needed_groups:
-            desc_file = os.path.join(self.data_root, 'cad_desc', f'{group_id}.json')
-            if os.path.exists(desc_file):
-                with open(desc_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                self.text_cache[group_id] = {
-                    entry['id']: entry.get('text caption', '')
-                    for entry in data if 'id' in entry
-                }
-            else:
-                self.text_cache[group_id] = {}
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_lmdb_env'] = None
+        state['_lmdb_txn'] = None
+        return state
 
     def __len__(self):
         return len(self.data_list)
@@ -92,10 +219,14 @@ class CADDataset(Dataset):
         if len(parts) < 2:
             raise ValueError(f'Invalid sample id format: {sample_id}')
 
-        group_id, sample_name = parts[0], parts[1]
-        images = self._load_images(group_id, sample_name)
+        if self.backend == 'lmdb':
+            images, text, cad_seq, cad_valid_mask = self._load_from_lmdb(sample_id)
+        else:
+            group_id, sample_name = parts[0], parts[1]
+            images = self._load_images_from_files(group_id, sample_name)
+            text = self._get_text(sample_id, group_id)
+            cad_seq, cad_valid_mask = self._load_cad_vector_from_files(group_id, sample_name)
 
-        text = self._get_text(sample_id, group_id)
         text_encoding = self.tokenizer(
             text,
             max_length=self.text_max_len,
@@ -105,8 +236,6 @@ class CADDataset(Dataset):
         )
         text_input_ids = text_encoding['input_ids'].squeeze(0)
         text_attention_mask = text_encoding['attention_mask'].squeeze(0)
-
-        cad_seq, cad_valid_mask = self._load_cad_vector(group_id, sample_name)
 
         return {
             'sample_id': sample_id,
@@ -118,64 +247,72 @@ class CADDataset(Dataset):
             'cad_valid_mask': cad_valid_mask
         }
 
-    def _load_images(self, group_id, sample_name):
-        """加载 8 视图图像"""
-        images = []
-        img_dir = os.path.join(self.data_root, 'cad_img', group_id, sample_name)
+    def _ensure_lmdb_open(self):
+        if self._lmdb_env is not None:
+            return
 
-        for i in range(8):
-            img_path = os.path.join(img_dir, f'{sample_name}_{i:03d}.png')
-            if os.path.exists(img_path):
-                img = Image.open(img_path).convert('RGB')
+        self._validate_lmdb_available()
+        self._lmdb_env = lmdb.open(
+            self._lmdb_path,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False,
+            max_readers=self.lmdb_readers,
+            subdir=os.path.isdir(self._lmdb_path),
+        )
+        self._lmdb_txn = self._lmdb_env.begin(write=False)
+
+    def _load_from_lmdb(self, sample_id):
+        self._ensure_lmdb_open()
+        payload = self._lmdb_txn.get(sample_id.encode('utf-8'))
+        if payload is None:
+            raise KeyError(f'Sample id not found in LMDB: {sample_id}')
+
+        record = pickle.loads(payload)
+        image_bytes_list = record.get('image_bytes', [])
+        images = self._load_images_from_bytes(image_bytes_list)
+
+        text = record.get('text', '')
+        cad_array = np.asarray(record.get('cad_seq', np.zeros((0, 20), dtype=np.float32)), dtype=np.float32)
+        cad_seq = torch.from_numpy(cad_array).float()
+        cad_valid_mask = (cad_seq[:, 0] >= 0).bool()
+        return images, text, cad_seq, cad_valid_mask
+
+    def _load_images_from_files(self, group_id, sample_name):
+        image_bytes_list = load_image_bytes_from_files(
+            self.data_root, group_id, sample_name, n_views=self.n_views
+        )
+        return self._load_images_from_bytes(image_bytes_list)
+
+    def _load_images_from_bytes(self, image_bytes_list):
+        images = []
+        for image_bytes in image_bytes_list[:self.n_views]:
+            if image_bytes:
+                img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
                 img = self.image_transform(img)
             else:
                 img = torch.ones(3, self.img_size, self.img_size)
             images.append(img)
+
+        while len(images) < self.n_views:
+            images.append(torch.ones(3, self.img_size, self.img_size))
         return torch.stack(images)
 
     def _get_text(self, sample_id, group_id):
-        """获取文本描述"""
         if group_id in self.text_cache and sample_id in self.text_cache[group_id]:
             return self.text_cache[group_id][sample_id]
         return ''
 
-    def _load_cad_vector(self, group_id, sample_name):
-        """加载 CAD 向量序列"""
-        vec_path = os.path.join(self.data_root, 'cad_vec', group_id, f'{sample_name}.h5')
-        if os.path.exists(vec_path):
-            try:
-                with h5py.File(vec_path, 'r') as f:
-                    for key in ['cad_seq', 'sequence', 'data', 'vec']:
-                        if key in f:
-                            data = f[key][:]
-                            break
-                    else:
-                        key = list(f.keys())[0]
-                        data = f[key][:]
-
-                if len(data.shape) == 1:
-                    data = data.reshape(-1, 17)
-
-                if data.shape[1] == 17:
-                    padded = np.zeros((data.shape[0], 20), dtype=np.float32)
-                    padded[:, :17] = data.astype(np.float32)
-                    data = padded
-                elif data.shape[1] != 20:
-                    raise ValueError(f'Unexpected CAD vector shape: {data.shape}')
-
-                cad_seq = torch.from_numpy(data).float()
-                cad_valid_mask = cad_seq[:, 0] >= 0
-                return cad_seq, cad_valid_mask.bool()
-            except Exception as e:
-                print(f'Warning: Failed to load CAD vector {vec_path}: {e}')
-
-        empty_seq = torch.zeros(0, 20, dtype=torch.float32)
-        empty_mask = torch.zeros(0, dtype=torch.bool)
-        return empty_seq, empty_mask
+    def _load_cad_vector_from_files(self, group_id, sample_name):
+        cad_array = load_cad_array_from_files(self.data_root, group_id, sample_name)
+        cad_seq = torch.from_numpy(cad_array).float()
+        cad_valid_mask = (cad_seq[:, 0] >= 0).bool()
+        return cad_seq, cad_valid_mask
 
 
 def collate_fn(batch):
-    """Batch 数据合并"""
+    """Batch 数据合并。"""
     sample_ids = [item['sample_id'] for item in batch]
     images = torch.stack([item['images'] for item in batch])
     texts = [item['text'] for item in batch]
@@ -218,9 +355,22 @@ def collate_fn(batch):
     }
 
 
-def build_dataloader(data_root, split='train', batch_size=32, num_workers=4, ids_file=None,
-                     img_size=224, text_max_len=64, tokenizer_name='bert-base-uncased'):
-    """构建数据加载器"""
+def build_dataloader(
+    data_root,
+    split='train',
+    batch_size=32,
+    num_workers=4,
+    ids_file=None,
+    img_size=224,
+    text_max_len=64,
+    tokenizer_name='bert-base-uncased',
+    backend='files',
+    lmdb_path=None,
+    pin_memory=True,
+    persistent_workers=None,
+    prefetch_factor=2,
+):
+    """构建数据加载器。"""
     dataset = CADDataset(
         data_root,
         split=split,
@@ -228,11 +378,20 @@ def build_dataloader(data_root, split='train', batch_size=32, num_workers=4, ids
         img_size=img_size,
         text_max_len=text_max_len,
         tokenizer_name=tokenizer_name,
+        backend=backend,
+        lmdb_path=lmdb_path,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(split == 'train'),
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
+
+    loader_kwargs = {
+        'dataset': dataset,
+        'batch_size': batch_size,
+        'shuffle': (split == 'train'),
+        'num_workers': num_workers,
+        'collate_fn': collate_fn,
+        'pin_memory': pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = num_workers > 0 if persistent_workers is None else persistent_workers
+        loader_kwargs['prefetch_factor'] = prefetch_factor
+
+    return DataLoader(**loader_kwargs)

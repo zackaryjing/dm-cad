@@ -46,3 +46,4 @@ dependencies:
       # geometry / CAD utils
       - trimesh
       - h5py
+      - lmdb
