@@ -211,6 +211,9 @@ class CADDataset(Dataset):
         state['_lmdb_txn'] = None
         return state
 
+    def __del__(self):
+        self._close_lmdb()
+
     def __len__(self):
         return len(self.data_list)
 
@@ -249,8 +252,10 @@ class CADDataset(Dataset):
         }
 
     def _ensure_lmdb_open(self):
-        if self._lmdb_env is not None:
+        if self._lmdb_env is not None and self._lmdb_txn is not None:
             return
+
+        self._close_lmdb()
 
         self._validate_lmdb_available()
         self._lmdb_env = lmdb.open(
@@ -263,6 +268,24 @@ class CADDataset(Dataset):
             subdir=os.path.isdir(self._lmdb_path),
         )
         self._lmdb_txn = self._lmdb_env.begin(write=False)
+
+    def _close_lmdb(self):
+        txn = getattr(self, '_lmdb_txn', None)
+        env = getattr(self, '_lmdb_env', None)
+
+        if txn is not None:
+            try:
+                txn.abort()
+            except Exception:
+                pass
+            self._lmdb_txn = None
+
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
+            self._lmdb_env = None
 
     def _load_from_lmdb(self, sample_id):
         self._ensure_lmdb_open()
