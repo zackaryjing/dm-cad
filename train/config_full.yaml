@@ -51,6 +51,10 @@ data:
   test_ids_file: test_ids.txt
   backend: lmdb
   lmdb_path: cad_data.lmdb
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 1
+  max_prefetch_gb: 32.0
 
 log:
   log_dir: ./runs/dmcad

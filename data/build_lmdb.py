@@ -45,8 +45,8 @@ def parse_args():
                         help=f'输出 LMDB 路径，默认 <data-root>/{DEFAULT_LMDB_FILENAME}')
     parser.add_argument('--ids-files', type=str, nargs='*', default=None,
                         help='需要打包的 ids 文件列表；相对路径基于 data-root')
-    parser.add_argument('--map-size-gb', type=float, default=512.0,
-                        help='LMDB map size in GB，默认 512')
+    parser.add_argument('--map-size-gb', type=float, default=64.0,
+                        help='LMDB map size in GB，默认 64')
     parser.add_argument('--commit-every', type=int, default=1024,
                         help='每写入多少个样本提交一次事务，默认 1024')
     parser.add_argument('--force', action='store_true',

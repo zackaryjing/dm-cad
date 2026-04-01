@@ -119,6 +119,7 @@ def main():
     print(f'  Dataset backend: {data_backend}')
     if data_backend == 'lmdb':
         print(f'  LMDB path: {lmdb_path or "cad_data.lmdb"}')
+    print(f'  Requested num_workers: {training_cfg["num_workers"]}')
     train_ids_file = data_cfg.get('train_ids_file')
     train_loader = build_dataloader(
         data_root=data_root,
@@ -130,15 +131,28 @@ def main():
         text_max_len=data_cfg.get('text_max_len', 64),
         backend=data_cfg.get('backend', 'files'),
         lmdb_path=data_cfg.get('lmdb_path'),
+        pin_memory=data_cfg.get('pin_memory', True),
+        persistent_workers=data_cfg.get('persistent_workers'),
+        prefetch_factor=data_cfg.get('prefetch_factor', 1),
+        max_prefetch_gb=data_cfg.get('max_prefetch_gb', 8.0),
     )
     if train_ids_file:
         print(f'  Using ids file: {train_ids_file}')
+    print(f'  Effective num_workers: {train_loader.num_workers}')
+    if train_loader.num_workers > 0:
+        print(f'  Prefetch factor: {train_loader.prefetch_factor}')
+    print(f'  Estimated image memory per batch: {train_loader.estimated_batch_gb:.2f} GiB')
+    if train_loader.num_workers > 0:
+        print(f'  Estimated prefetched batches: {train_loader.estimated_prefetched_batches}')
+        print(f'  Estimated prefetched image memory: {train_loader.estimated_prefetch_gb:.2f} GiB')
+        print(f'  Configured prefetch memory cap: {train_loader.max_prefetch_gb:.1f} GiB')
     print(f'  Loaded {len(train_loader.dataset)} samples')
 
     print(f'Loading validation data from {data_root}...')
     print(f'  Dataset backend: {data_backend}')
     if data_backend == 'lmdb':
         print(f'  LMDB path: {lmdb_path or "cad_data.lmdb"}')
+    print(f'  Requested num_workers: {training_cfg["num_workers"]}')
     test_ids_file = data_cfg.get('test_ids_file')
     val_loader = build_dataloader(
         data_root=data_root,
@@ -150,9 +164,21 @@ def main():
         text_max_len=data_cfg.get('text_max_len', 64),
         backend=data_cfg.get('backend', 'files'),
         lmdb_path=data_cfg.get('lmdb_path'),
+        pin_memory=data_cfg.get('pin_memory', True),
+        persistent_workers=data_cfg.get('persistent_workers'),
+        prefetch_factor=data_cfg.get('prefetch_factor', 1),
+        max_prefetch_gb=data_cfg.get('max_prefetch_gb', 8.0),
     )
     if test_ids_file:
         print(f'  Using ids file: {test_ids_file}')
+    print(f'  Effective num_workers: {val_loader.num_workers}')
+    if val_loader.num_workers > 0:
+        print(f'  Prefetch factor: {val_loader.prefetch_factor}')
+    print(f'  Estimated image memory per batch: {val_loader.estimated_batch_gb:.2f} GiB')
+    if val_loader.num_workers > 0:
+        print(f'  Estimated prefetched batches: {val_loader.estimated_prefetched_batches}')
+        print(f'  Estimated prefetched image memory: {val_loader.estimated_prefetch_gb:.2f} GiB')
+        print(f'  Configured prefetch memory cap: {val_loader.max_prefetch_gb:.1f} GiB')
     print(f'  Loaded {len(val_loader.dataset)} samples')
 
     print(f'Starting training for {training_cfg["num_epochs"]} epochs...')

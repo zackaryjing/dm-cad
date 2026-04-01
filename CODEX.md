@@ -258,6 +258,92 @@ Files:
 Changes:
 - Added configurable AMP support with `training.use_amp`.
 - Enabled AMP in both training and validation.
+
+
+## Session 2026-04-01 LMDB Follow-Up And Loader Memory Safety
+
+### Context
+Previous commit:
+- `0d45c6e` - `bug: try to add lmdb but caused problem, HAVEN'T FIX`
+
+This follow-up addresses the memory blow-up risk introduced after switching full training to LMDB-backed loading.
+
+### Root Cause Analysis
+Files:
+- `data/dataset.py`
+- `train_main.py`
+- `train/config_full.yaml`
+
+Findings:
+- The critical failure mode was not LMDB `map_size` directly consuming RAM.
+- The actual risk came from combining:
+  - very large `batch_size` (`512`)
+  - many dataloader workers (`48`)
+  - worker-side prefetching
+  - `pin_memory=True`
+  - faster backend throughput after moving from scattered files to LMDB
+- For the full config, image tensors alone are about `2.30 GiB` per batch:
+  - `512 × 8 × 3 × 224 × 224 × 4 bytes`
+- With `48` workers and `prefetch_factor=2`, the loader could theoretically accumulate around `96` prefetched batches.
+- Image tensors alone at that scale are about `220 GiB`, before adding:
+  - pinned-memory staging
+  - PNG decode intermediates
+  - tokenizer outputs
+  - CAD tensors
+  - Python object overhead
+  - page cache and general process memory
+- This makes host memory usage in the `300 GiB+` range plausible on a `504 GiB` machine.
+
+### Fixes Applied
+Files:
+- `data/dataset.py`
+- `data/build_lmdb.py`
+- `train_main.py`
+- `eval_main.py`
+- `train/config.yaml`
+- `train/config_5k.yaml`
+- `train/config_5k_short.yaml`
+- `train/config_20k.yaml`
+- `train/config_full.yaml`
+- `README.md`
+
+Changes:
+- Added an explicit prefetch memory budget control: `data.max_prefetch_gb`.
+- Changed loader defaults to safer values:
+  - `prefetch_factor: 1`
+  - `persistent_workers: false`
+- Added automatic worker downscaling based on estimated prefetched image memory.
+- Added startup logging for:
+  - requested worker count
+  - effective worker count
+  - estimated image memory per batch
+  - estimated prefetched batch count
+  - estimated prefetched image memory
+  - configured prefetch cap
+- Added matching config fields to all train configs with scale-dependent defaults.
+- Documented LMDB and loader-memory controls in `README.md`.
+- Lowered the LMDB build script default `map_size` from `512 GB` to `64 GB` to reduce confusion and keep defaults closer to the actual dataset footprint.
+
+### Design Notes
+- `max_prefetch_gb` has higher priority than the requested `num_workers`.
+- The loader computes an `effective_num_workers` before constructing `DataLoader`.
+- Workers are not created in a partially-starved state. The code reduces worker count so that each remaining worker can still prefetch full batches normally.
+- The current estimator controls image-tensor memory only. Real total memory usage will be higher because it excludes non-image allocations.
+
+### Resource Understanding For This Machine
+- This server has enough RAM to tolerate a meaningful prefetch window, but not an unbounded one.
+- A `32 GiB` prefetched-image budget is aggressive enough to use the machine while still leaving headroom for:
+  - the model process
+  - pinned memory
+  - operating system cache
+  - remote management and shell responsiveness
+- The bottleneck after moving to LMDB is no longer just raw disk I/O. CPU-side decode, tokenization, and dataloader queue sizing become first-order concerns.
+
+### Validation Status
+- Static validation only:
+  - `python -m compileall data train_main.py eval_main.py`
+- This fix has **not** been runtime-verified yet on the target server after the memory-guard changes.
+- Before long full runs, start with a short launch and confirm the startup log matches the expected effective worker count and prefetch memory estimate.
 - Added `GradScaler` integration and AMP-safe gradient clipping.
 - Added default ViT backbone freezing in `ViewEncoder`.
 - Propagated `model.freeze_vit` and `model.pretrained_vit` through the main model config.

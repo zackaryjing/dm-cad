@@ -153,6 +153,10 @@ def main():
         text_max_len=data_cfg.get('text_max_len', 64),
         backend=data_cfg.get('backend', 'files'),
         lmdb_path=data_cfg.get('lmdb_path'),
+        pin_memory=data_cfg.get('pin_memory', True),
+        persistent_workers=data_cfg.get('persistent_workers'),
+        prefetch_factor=data_cfg.get('prefetch_factor', 1),
+        max_prefetch_gb=data_cfg.get('max_prefetch_gb', 8.0),
     )
     if ids_file:
         print(f'  Using ids file: {ids_file}')

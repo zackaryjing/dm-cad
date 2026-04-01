@@ -61,6 +61,12 @@ python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/c
 - `data.data_root`: 数据集根目录 (默认：`datasets/dataset_v1`)
 - `data.train_ids_file`: 训练集 ids 文件 (**相对于 data_root**)
 - `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
+- `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
+- `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
+- `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`
+- `data.persistent_workers`: 是否在 epoch 间保留 worker 进程，默认 `false`
+- `data.prefetch_factor`: 每个 worker 预取的 batch 数，默认 `1`
+- `data.max_prefetch_gb`: DataLoader 允许的预取图像内存预算上限（GiB）；会据此自动下调有效 `num_workers`
 
 ## 评估
 
@@ -130,6 +136,32 @@ datasets/dataset_v1/
         └── <sample_id>.h5   # CAD 向量序列
 ```
 
+### LMDB 格式
+
+项目支持将散文件数据集预打包为单个 LMDB 数据库，以减少大量小文件随机读取造成的 I/O 抖动。
+
+推荐构建命令：
+
+```bash
+python -m data.build_lmdb \
+    --data-root datasets/dataset_v0 \
+    --output datasets/dataset_v0/cad_data.lmdb \
+    --ids-files train_ids.txt test_ids.txt
+```
+
+启用 LMDB 时，在配置文件中添加：
+
+```yaml
+data:
+  backend: lmdb
+  lmdb_path: cad_data.lmdb
+```
+
+LMDB 中每个 sample 使用 `group_id/sample_name` 作为 key，value 包含：
+- 8 视图图像的原始 PNG bytes
+- 文本描述
+- `float32 [seq_len, 20]` 的 CAD 序列
+
 ## 关键设计说明
 
 ### 命令类型 (6 种，DeepCAD 格式)
@@ -183,6 +215,13 @@ L_param = SmoothL1(param_pred, param_gt)  # 19 维，仅有效位置计算
 ### 数据路径问题
 - ids 文件路径**相对于 `data_root`**，在 `train/config.yaml` 中配置
 - 训练时不需传递 `--data_dir`，直接从配置文件读取
+
+### DataLoader 内存控制
+- `pin_memory`: 让 CPU 到 GPU 的拷贝更快，但会增加主机侧 pinned memory 占用
+- `persistent_workers`: 若为 `true`，worker 不会在每个 epoch 结束后退出；吞吐更稳，但长期占用更多内存与进程资源
+- `prefetch_factor`: 每个 worker 在后台提前准备多少个 batch；值越大，吞吐潜力越高，但更容易堆积大量 batch 内存
+- `max_prefetch_gb`: 预取图像张量的估算内存预算上限；DataLoader 会按 `batch_size × 8 × 3 × H × W × 4 bytes` 估算单 batch 图像内存，并自动限制有效 `num_workers`
+- 对于大 batch 训练，建议保持 `prefetch_factor=1`，再根据机器内存逐步增加 `max_prefetch_gb`
 
 ### 命令类型不匹配
 - 模型使用 **6 种命令类型** (DeepCAD 原始格式)

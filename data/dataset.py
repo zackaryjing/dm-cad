@@ -33,6 +33,7 @@ except ImportError:
 
 
 DEFAULT_LMDB_FILENAME = 'cad_data.lmdb'
+DEFAULT_MAX_PREFETCH_GB = 8.0
 
 
 def resolve_ids_path(data_root, split='train', ids_file=None):
@@ -368,7 +369,8 @@ def build_dataloader(
     lmdb_path=None,
     pin_memory=True,
     persistent_workers=None,
-    prefetch_factor=2,
+    prefetch_factor=1,
+    max_prefetch_gb=DEFAULT_MAX_PREFETCH_GB,
 ):
     """构建数据加载器。"""
     dataset = CADDataset(
@@ -382,16 +384,42 @@ def build_dataloader(
         lmdb_path=lmdb_path,
     )
 
+    effective_num_workers = num_workers
+    effective_prefetch_factor = prefetch_factor
+    per_sample_image_bytes = dataset.n_views * 3 * img_size * img_size * 4
+    estimated_batch_bytes = per_sample_image_bytes * batch_size
+    estimated_prefetched_batches = 0
+    if num_workers > 0:
+        if max_prefetch_gb is not None and max_prefetch_gb > 0:
+            max_prefetch_bytes = int(max_prefetch_gb * (1024 ** 3))
+            max_prefetched_batches = max(1, max_prefetch_bytes // max(estimated_batch_bytes, 1))
+            max_workers_for_prefetch = max(1, max_prefetched_batches // max(prefetch_factor, 1))
+            if effective_num_workers > max_workers_for_prefetch:
+                print(
+                    f'Reducing num_workers from {effective_num_workers} to {max_workers_for_prefetch} '
+                    f'to keep estimated prefetched image memory under {max_prefetch_gb:.1f} GiB '
+                    f'(batch_size={batch_size}, img_size={img_size}, n_views={dataset.n_views}).'
+                )
+                effective_num_workers = max_workers_for_prefetch
+        estimated_prefetched_batches = effective_num_workers * max(effective_prefetch_factor, 1)
+
     loader_kwargs = {
         'dataset': dataset,
         'batch_size': batch_size,
         'shuffle': (split == 'train'),
-        'num_workers': num_workers,
+        'num_workers': effective_num_workers,
         'collate_fn': collate_fn,
         'pin_memory': pin_memory,
     }
-    if num_workers > 0:
-        loader_kwargs['persistent_workers'] = num_workers > 0 if persistent_workers is None else persistent_workers
-        loader_kwargs['prefetch_factor'] = prefetch_factor
+    if effective_num_workers > 0:
+        loader_kwargs['persistent_workers'] = False if persistent_workers is None else persistent_workers
+        loader_kwargs['prefetch_factor'] = effective_prefetch_factor
 
-    return DataLoader(**loader_kwargs)
+    dataloader = DataLoader(**loader_kwargs)
+    dataloader.estimated_batch_gb = estimated_batch_bytes / (1024 ** 3)
+    dataloader.estimated_prefetched_batches = estimated_prefetched_batches
+    dataloader.estimated_prefetch_gb = (
+        dataloader.estimated_batch_gb * estimated_prefetched_batches if estimated_prefetched_batches > 0 else 0.0
+    )
+    dataloader.max_prefetch_gb = max_prefetch_gb
+    return dataloader
