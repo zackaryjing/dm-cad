@@ -32,6 +32,11 @@ class DualModalCADGenerator(nn.Module):
         start_token = self.config.get('start_token', 4)
         freeze_vit = self.config.get('freeze_vit', True)
         pretrained_vit = self.config.get('pretrained_vit', True)
+        visual_memory_mode = self.config.get('visual_memory_mode', 'view_tokens')
+        use_global_fused_condition = self.config.get('use_global_fused_condition', True)
+        decoder_condition_injection = self.config.get('decoder_condition_injection', 'film_residual')
+        decoder_condition_hidden_dim = self.config.get('decoder_condition_hidden_dim', embed_dim)
+        decoder_condition_scale = self.config.get('decoder_condition_scale', 1.0)
 
         self.view_encoder = ViewEncoder(
             embed_dim=embed_dim,
@@ -50,8 +55,13 @@ class DualModalCADGenerator(nn.Module):
             n_layers=n_layers,
             n_heads=n_heads,
             max_seq_len=max_seq_len,
-            start_token=start_token
+            start_token=start_token,
+            condition_injection=decoder_condition_injection,
+            condition_hidden_dim=decoder_condition_hidden_dim,
+            condition_scale=decoder_condition_scale,
         )
+        self.visual_memory_mode = visual_memory_mode
+        self.use_global_fused_condition = use_global_fused_condition
 
     def _default_config(self):
         return {
@@ -64,20 +74,39 @@ class DualModalCADGenerator(nn.Module):
             'start_token': 4,
             'freeze_vit': True,
             'pretrained_vit': True,
+            'visual_memory_mode': 'view_tokens',
+            'use_global_fused_condition': True,
+            'decoder_condition_injection': 'film_residual',
+            'decoder_condition_hidden_dim': 512,
+            'decoder_condition_scale': 1.0,
         }
 
     def forward(self, images, text_input_ids, text_attention_mask, tgt_cad_seq=None):
         """前向传播"""
-        z_fused = self._encode_modalities(images, text_input_ids, text_attention_mask)
-        return self.cad_decoder(z_fused, tgt_cad_seq, training=self.training)
+        visual_memory, global_condition = self._encode_modalities(images, text_input_ids, text_attention_mask)
+        return self.cad_decoder(
+            visual_memory,
+            global_condition,
+            tgt_cad_seq,
+            training=self.training
+        )
 
     def generate(self, images, text_input_ids, text_attention_mask, max_steps=120):
         """推理模式 - 生成 CAD 序列"""
-        z_fused = self._encode_modalities(images, text_input_ids, text_attention_mask)
-        return self.cad_decoder.generate(z_fused, max_steps=max_steps)
+        visual_memory, global_condition = self._encode_modalities(images, text_input_ids, text_attention_mask)
+        return self.cad_decoder.generate(
+            visual_memory,
+            global_condition,
+            max_steps=max_steps
+        )
 
     def encode_images(self, images):
-        """仅图像编码"""
+        """仅图像编码，返回全局图像特征。"""
+        _, z_img_global = self.encode_image_memory(images)
+        return z_img_global
+
+    def encode_image_memory(self, images):
+        """图像编码，返回视图级 memory token 和全局特征。"""
         batch_size, n_views, channels, height, width = images.shape
         embed_dim = self.config['embed_dim']
         images_flat = images.view(batch_size * n_views, channels, height, width)
@@ -90,6 +119,14 @@ class DualModalCADGenerator(nn.Module):
         return self.text_encoder(text_input_ids, text_attention_mask)
 
     def _encode_modalities(self, images, text_input_ids, text_attention_mask):
-        z_img = self.encode_images(images)
+        z_img_tokens, z_img = self.encode_image_memory(images)
         z_txt = self.encode_text(text_input_ids, text_attention_mask)
-        return self.modal_fusion(z_img, z_txt)
+        z_fused = self.modal_fusion(z_img, z_txt)
+
+        if self.visual_memory_mode == 'global_only':
+            visual_memory = z_img.unsqueeze(1)
+        else:
+            visual_memory = z_img_tokens
+
+        global_condition = z_fused if self.use_global_fused_condition else None
+        return visual_memory, global_condition

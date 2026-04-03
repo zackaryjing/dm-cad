@@ -79,7 +79,8 @@ class MultiViewFusion(nn.Module):
         Args:
             view_features: [batch, n_views, embed_dim] - 各视图特征
         Returns:
-            fused: [batch, embed_dim] - 融合后的特征 (通过 [CLS] 聚合)
+            view_tokens: [batch, n_views, embed_dim] - 编码后的多视图 token
+            fused: [batch, embed_dim] - 融合后的全局特征 (通过 [CLS] 聚合)
         """
         batch_size = view_features.shape[0]
 
@@ -88,4 +89,5 @@ class MultiViewFusion(nn.Module):
         transformer_input = torch.cat([cls_tokens, view_features], dim=1)
         encoded = self.transformer(transformer_input)
         fused = encoded[:, 0]
-        return self.aggregate(fused)
+        view_tokens = encoded[:, 1:]
+        return view_tokens, self.aggregate(fused)
