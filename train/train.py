@@ -31,6 +31,12 @@ class Trainer:
         self.device = self._resolve_runtime_device(device)
         self.use_amp = bool(self.training_cfg.get('use_amp', False)) and self.device.type == 'cuda'
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.profile_timing = bool(self.training_cfg.get('profile_timing', False))
+        self.profile_steps = max(int(self.training_cfg.get('profile_steps', 20)), 1)
+        self.profile_warmup_steps = max(int(self.training_cfg.get('profile_warmup_steps', 5)), 0)
+        self.debug_monitor_enabled = bool(self.training_cfg.get('debug_monitor_enabled', False))
+        self.debug_log_every_batches = max(int(self.training_cfg.get('debug_log_every_batches', 50)), 1)
+        self.global_train_step = 0
 
         if self.training_cfg.get('use_amp', False) and self.device.type != 'cuda':
             print('AMP requested but CUDA is not active; running without AMP.')
@@ -104,6 +110,114 @@ class Trainer:
         for group, base_lr in zip(self.optimizer.param_groups, self.scheduler.base_lrs):
             group['lr'] = base_lr * factor
 
+    def _sync_profile_cuda(self):
+        if self.device.type != 'cuda':
+            return
+        for device_idx in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(device_idx)
+
+    def _init_timing_stats(self):
+        return {
+            'count': 0,
+            'data_time': 0.0,
+            'h2d_time': 0.0,
+            'forward_time': 0.0,
+            'backward_time': 0.0,
+            'optimizer_time': 0.0,
+            'step_time': 0.0,
+        }
+
+    def _maybe_record_timing(self, timing_stats, batch_idx, data_time, h2d_time, forward_time, backward_time, optimizer_time, step_time):
+        if not self.profile_timing:
+            return
+        if batch_idx < self.profile_warmup_steps:
+            return
+        if timing_stats['count'] >= self.profile_steps:
+            return
+
+        timing_stats['count'] += 1
+        timing_stats['data_time'] += data_time
+        timing_stats['h2d_time'] += h2d_time
+        timing_stats['forward_time'] += forward_time
+        timing_stats['backward_time'] += backward_time
+        timing_stats['optimizer_time'] += optimizer_time
+        timing_stats['step_time'] += step_time
+
+    def _print_timing_summary(self, timing_stats, epoch):
+        if not self.profile_timing or timing_stats['count'] == 0:
+            return
+
+        count = timing_stats['count']
+        avg = {key: value / count for key, value in timing_stats.items() if key != 'count'}
+        total = avg['step_time'] if avg['step_time'] > 0 else 1e-12
+        print(
+            f'[Timing][Epoch {epoch}] averaged over {count} steps '
+            f'(after {self.profile_warmup_steps} warmup steps): '
+            f'data={avg["data_time"] * 1000:.1f}ms ({avg["data_time"] / total * 100:.1f}%), '
+            f'h2d={avg["h2d_time"] * 1000:.1f}ms ({avg["h2d_time"] / total * 100:.1f}%), '
+            f'forward={avg["forward_time"] * 1000:.1f}ms ({avg["forward_time"] / total * 100:.1f}%), '
+            f'backward={avg["backward_time"] * 1000:.1f}ms ({avg["backward_time"] / total * 100:.1f}%), '
+            f'optimizer={avg["optimizer_time"] * 1000:.1f}ms ({avg["optimizer_time"] / total * 100:.1f}%), '
+            f'step={avg["step_time"] * 1000:.1f}ms'
+        )
+
+    def _compute_grad_norm(self):
+        total = 0.0
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            grad = param.grad.detach()
+            total += grad.float().pow(2).sum().item()
+        return math.sqrt(total) if total > 0 else 0.0
+
+    def _compute_cmd_distribution(self, cmd_logits, cmd_gt, valid_mask):
+        valid_mask = valid_mask.bool()
+        if not valid_mask.any():
+            zero = [0.0] * cmd_logits.shape[-1]
+            return zero, zero
+
+        pred = torch.argmax(cmd_logits.detach(), dim=-1)
+        gt = cmd_gt.detach().clamp(min=0, max=cmd_logits.shape[-1] - 1)
+        pred_valid = pred[valid_mask]
+        gt_valid = gt[valid_mask]
+        n_cmd = cmd_logits.shape[-1]
+
+        pred_hist = torch.bincount(pred_valid, minlength=n_cmd).float()
+        gt_hist = torch.bincount(gt_valid, minlength=n_cmd).float()
+        pred_hist = (pred_hist / pred_hist.sum().clamp_min(1.0)).cpu().tolist()
+        gt_hist = (gt_hist / gt_hist.sum().clamp_min(1.0)).cpu().tolist()
+        return pred_hist, gt_hist
+
+    def _log_debug_step(self, batch_idx, loss, loss_dict, grad_norm, scaler_scale, pred_hist, gt_hist):
+        if not self.debug_monitor_enabled:
+            return
+        if (batch_idx + 1) % self.debug_log_every_batches != 0:
+            return
+
+        step = self.global_train_step
+        self.writer.add_scalar('debug/loss_step', loss.item(), step)
+        self.writer.add_scalar('debug/cmd_loss_step', loss_dict['cmd_loss'].item(), step)
+        self.writer.add_scalar('debug/eos_loss_step', loss_dict['eos_loss'].item(), step)
+        self.writer.add_scalar('debug/param_loss_step', loss_dict['param_loss'].item(), step)
+        self.writer.add_scalar('debug/grad_norm', grad_norm, step)
+        self.writer.add_scalar('debug/grad_scaler_scale', scaler_scale, step)
+
+        for idx, value in enumerate(pred_hist):
+            self.writer.add_scalar(f'debug/cmd_pred_frac_{idx}', value, step)
+        for idx, value in enumerate(gt_hist):
+            self.writer.add_scalar(f'debug/cmd_gt_frac_{idx}', value, step)
+
+        pred_top = max(range(len(pred_hist)), key=lambda i: pred_hist[i]) if pred_hist else -1
+        gt_top = max(range(len(gt_hist)), key=lambda i: gt_hist[i]) if gt_hist else -1
+        print(
+            f'[Debug][Epoch {self.epoch} Batch {batch_idx + 1} Step {step}] '
+            f'loss={loss.item():.4f} cmd={loss_dict["cmd_loss"].item():.4f} '
+            f'eos={loss_dict["eos_loss"].item():.4f} param={loss_dict["param_loss"].item():.4f} '
+            f'grad_norm={grad_norm:.4f} scaler={scaler_scale:.1f} '
+            f'pred_top=cmd{pred_top}:{pred_hist[pred_top]:.3f} '
+            f'gt_top=cmd{gt_top}:{gt_hist[gt_top]:.3f}'
+        )
+
     def _resolve_runtime_device(self, requested_device):
         if requested_device != 'cuda' or not torch.cuda.is_available():
             return torch.device(requested_device)
@@ -174,14 +288,23 @@ class Trainer:
 
         processed_batches = 0
         skipped_batches = 0
+        timing_stats = self._init_timing_stats()
+        iteration_end_time = time.perf_counter()
         for batch_idx, batch in enumerate(pbar):
+            step_start_time = time.perf_counter()
+            data_time = step_start_time - iteration_end_time
+
+            h2d_start_time = time.perf_counter()
             images = batch['images'].to(self.device, non_blocking=True)
             text_input_ids = batch['text_input_ids'].to(self.device, non_blocking=True)
             text_attention_mask = batch['text_attention_mask'].to(self.device, non_blocking=True)
             cad_seq = batch['cad_seq'].to(self.device, non_blocking=True)
             cad_valid_mask = batch['cad_valid_mask'].to(self.device, non_blocking=True)
+            self._sync_profile_cuda()
+            h2d_time = time.perf_counter() - h2d_start_time
 
             self.optimizer.zero_grad(set_to_none=True)
+            forward_start_time = time.perf_counter()
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 cmd_logits, param_pred = self.model(
                     images, text_input_ids, text_attention_mask, cad_seq
@@ -194,32 +317,70 @@ class Trainer:
                 loss, loss_dict = self.criterion(
                     cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask, progress=progress
                 )
+            self._sync_profile_cuda()
+            forward_time = time.perf_counter() - forward_start_time
 
             if not torch.isfinite(loss):
                 skipped_batches += 1
                 self.optimizer.zero_grad(set_to_none=True)
                 pbar.set_postfix({'loss': 'non-finite', 'skipped': skipped_batches})
+                iteration_end_time = time.perf_counter()
                 continue
 
             grad_clip = self.training_cfg.get('gradient_clip', 1.0)
+            backward_start_time = time.perf_counter()
             if self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
             else:
                 loss.backward()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+            self._sync_profile_cuda()
+            backward_time = time.perf_counter() - backward_start_time
+
+            optimizer_start_time = time.perf_counter()
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
                 self.optimizer.step()
+            self._sync_profile_cuda()
+            optimizer_time = time.perf_counter() - optimizer_start_time
+
+            grad_norm = self._compute_grad_norm()
+            scaler_scale = float(self.scaler.get_scale()) if self.use_amp else 1.0
+            pred_hist, gt_hist = self._compute_cmd_distribution(cmd_logits, cmd_gt, cad_valid_mask)
 
             total_loss += loss.item()
             cmd_loss_total += loss_dict['cmd_loss'].item()
             eos_loss_total += loss_dict['eos_loss'].item()
             param_loss_total += loss_dict['param_loss'].item()
             processed_batches += 1
+            iteration_end_time = time.perf_counter()
+            step_time = iteration_end_time - step_start_time
+            self.global_train_step += 1
+            self._maybe_record_timing(
+                timing_stats,
+                batch_idx,
+                data_time,
+                h2d_time,
+                forward_time,
+                backward_time,
+                optimizer_time,
+                step_time
+            )
+            self._log_debug_step(
+                batch_idx,
+                loss,
+                loss_dict,
+                grad_norm,
+                scaler_scale,
+                pred_hist,
+                gt_hist
+            )
 
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
@@ -234,6 +395,8 @@ class Trainer:
 
         if processed_batches == 0:
             raise RuntimeError(f'No valid training batches were processed; skipped_batches={skipped_batches}')
+
+        self._print_timing_summary(timing_stats, self.epoch)
 
         return {
             'loss': total_loss / processed_batches,
