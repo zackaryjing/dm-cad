@@ -101,7 +101,7 @@ class Trainer:
         return lr_lambda
 
     def _training_progress(self, batch_idx, total_batches):
-        total_epochs = max(int(self.training_cfg.get('num_epochs', 1)), 1)
+        total_epochs = max(int(self.training_cfg.get('progress_total_epochs', self.training_cfg.get('num_epochs', 1))), 1)
         epoch_progress = (batch_idx + 1) / max(total_batches, 1)
         return min((self.epoch + epoch_progress) / total_epochs, 1.0)
 
@@ -332,10 +332,12 @@ class Trainer:
             if self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
+                grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
             else:
                 loss.backward()
+                grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
             self._sync_profile_cuda()
@@ -350,7 +352,6 @@ class Trainer:
             self._sync_profile_cuda()
             optimizer_time = time.perf_counter() - optimizer_start_time
 
-            grad_norm = self._compute_grad_norm()
             scaler_scale = float(self.scaler.get_scale()) if self.use_amp else 1.0
             pred_hist, gt_hist = self._compute_cmd_distribution(cmd_logits, cmd_gt, cad_valid_mask)
 
@@ -519,6 +520,12 @@ class Trainer:
         self.epoch = checkpoint['epoch'] + 1
         self.best_val_loss = checkpoint['best_val_loss']
         print(f'Loaded checkpoint from {checkpoint_path}')
+
+    def load_model_weights(self, checkpoint_path):
+        """仅从检查点加载模型参数，保留当前配置构建出的训练状态。"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self._load_state_dict_flexible(self._model_to_save(), checkpoint['model_state_dict'])
+        print(f'Loaded model weights from {checkpoint_path}; optimizer, scheduler, epoch, and best_val_loss were reset for a new run')
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, grad_clip=1.0):

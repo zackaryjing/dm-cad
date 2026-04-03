@@ -24,6 +24,8 @@ def parse_args():
                         help='Path to config file')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--no-resume-in-place', action='store_true',
+                        help='When used with --resume, create a new run directory and only initialize model weights from the checkpoint')
     parser.add_argument('--device', type=str, default=None,
                         help='Optional device override, e.g. cuda or cpu')
     return parser.parse_args()
@@ -42,11 +44,11 @@ def _ensure_unique_run_dir(base_log_dir, config_path):
     return run_dir
 
 
-def _resolve_log_dir(config, config_path, resume_path=None):
+def _resolve_log_dir(config, config_path, resume_path=None, resume_in_place=True):
     log_cfg = config.setdefault('log', {})
     configured_log_dir = log_cfg.get('log_dir', config.get('log_dir', 'runs/dmcad'))
 
-    if resume_path:
+    if resume_path and resume_in_place:
         checkpoint_path = Path(resume_path).resolve()
         try:
             run_dir = checkpoint_path.parent.parent
@@ -81,7 +83,11 @@ def main():
         config = yaml.safe_load(f)
     config = copy.deepcopy(config)
 
-    run_dir = _resolve_log_dir(config, args.config, args.resume)
+    resume_in_place = not args.no_resume_in_place
+    if args.no_resume_in_place and not args.resume:
+        print('--no-resume-in-place has no effect without --resume; proceeding with a new run directory.')
+
+    run_dir = _resolve_log_dir(config, args.config, args.resume, resume_in_place=resume_in_place)
     _save_resolved_config(config, args.config, run_dir)
 
     visible_devices = apply_visible_devices(config)
@@ -113,7 +119,10 @@ def main():
     trainer = Trainer(config, device=device)
 
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        if resume_in_place:
+            trainer.load_checkpoint(args.resume)
+        else:
+            trainer.load_model_weights(args.resume)
 
     print(f'Loading training data from {data_root}...')
     print(f'  Dataset backend: {data_backend}')

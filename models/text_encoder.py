@@ -3,6 +3,10 @@
 基于设计文档 3.3 节
 """
 
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub")
+
 import torch
 import torch.nn as nn
 from transformers import AutoModel

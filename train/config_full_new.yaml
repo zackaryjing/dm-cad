@@ -11,9 +11,9 @@ model:
   freeze_vit: true
 
 training:
-  batch_size: 128
-  num_epochs: 200
-  lr: 2.0e-05
+  batch_size: 256
+  num_epochs: 300
+  lr: 1.0e-05
   weight_decay: 0.01
   warmup_epochs: 5
   gradient_clip: 0.5
@@ -54,7 +54,7 @@ data:
   pin_memory: true
   persistent_workers: false
   prefetch_factor: 1
-  max_prefetch_gb: 16.0
+  max_prefetch_gb: 48.0
 
 log:
   log_dir: ./runs/dmcad

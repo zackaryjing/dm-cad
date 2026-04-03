@@ -55,12 +55,17 @@ python train_main.py --config train/config.yaml
 
 # 从检查点恢复训练 (继续写入该 checkpoint 所在的 run 目录)
 python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/checkpoints/epoch_10.pth
+
+# 从旧 checkpoint 初始化参数，但创建新的 run 目录继续实验
+# 这种模式只加载模型权重；optimizer、scheduler、epoch、best_val_loss 都会按新训练重置
+python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/checkpoints/epoch_10.pth --no-resume-in-place
 ```
 
 **配置说明** (`train/config.yaml`):
 - `data.data_root`: 数据集根目录 (默认：`datasets/dataset_v1`)
 - `data.train_ids_file`: 训练集 ids 文件 (**相对于 data_root**)
 - `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
+- `training.progress_total_epochs`: 可选；仅用于计算 loss curriculum 的训练进度分母。默认等于 `training.num_epochs`
 - `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
 - `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
 - `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`
@@ -222,6 +227,30 @@ L_param = SmoothL1(param_pred, param_gt)  # 19 维，仅有效位置计算
 - `prefetch_factor`: 每个 worker 在后台提前准备多少个 batch；值越大，吞吐潜力越高，但更容易堆积大量 batch 内存
 - `max_prefetch_gb`: 预取图像张量的估算内存预算上限；DataLoader 会按 `batch_size × 8 × 3 × H × W × 4 bytes` 估算单 batch 图像内存，并自动限制有效 `num_workers`
 - 对于大 batch 训练，建议保持 `prefetch_factor=1`，再根据机器内存逐步增加 `max_prefetch_gb`
+
+### Loss Curriculum 进度
+- `training.progress_total_epochs` 只影响 loss 中的 curriculum progress 计算。
+- 当前它只用于参数损失权重随训练进度逐步增强这一逻辑。
+- 若不设置，默认使用 `training.num_epochs`，行为与普通训练一致。
+- 这个字段的主要用途是做短程调试或从中间 checkpoint 恢复时，仍然复现原始长训练的 loss curriculum 节奏。
+
+例如：
+
+```yaml
+training:
+  num_epochs: 20
+  progress_total_epochs: 200
+```
+
+含义是：
+- 实际只训练到第 20 个 epoch
+- 但 loss curriculum 会按“总训练长度 200 个 epoch”来计算当前 progress
+
+注意：
+- `progress_total_epochs` **不会**改变学习率调度器的总 epoch
+- `progress_total_epochs` **不会**改变 checkpoint 保存频率
+- `progress_total_epochs` **不会**改变训练循环实际跑多少个 epoch
+- 它当前只影响 loss curriculum，不影响 optimizer / scheduler 的其它行为
 
 ### 命令类型不匹配
 - 模型使用 **6 种命令类型** (DeepCAD 原始格式)
