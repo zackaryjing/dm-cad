@@ -6,6 +6,7 @@
 import os
 import time
 import math
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -29,8 +30,9 @@ class Trainer:
         self.training_cfg = config.get('training', {})
         self.configured_visible_device_count = get_configured_visible_device_count(config)
         self.device = self._resolve_runtime_device(device)
-        self.use_amp = bool(self.training_cfg.get('use_amp', False)) and self.device.type == 'cuda'
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.precision = self._resolve_precision_mode()
+        self.autocast_enabled, self.autocast_dtype, self.use_grad_scaler = self._configure_precision()
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_grad_scaler)
         self.profile_timing = bool(self.training_cfg.get('profile_timing', False))
         self.profile_steps = max(int(self.training_cfg.get('profile_steps', 20)), 1)
         self.profile_warmup_steps = max(int(self.training_cfg.get('profile_warmup_steps', 5)), 0)
@@ -38,10 +40,11 @@ class Trainer:
         self.debug_log_every_batches = max(int(self.training_cfg.get('debug_log_every_batches', 50)), 1)
         self.global_train_step = 0
 
-        if self.training_cfg.get('use_amp', False) and self.device.type != 'cuda':
-            print('AMP requested but CUDA is not active; running without AMP.')
-        elif self.use_amp:
-            print('AMP mixed precision is enabled for training and evaluation.')
+        print(
+            f'Precision mode: {self.precision} '
+            f'(autocast={"enabled" if self.autocast_enabled else "disabled"}, '
+            f'grad_scaler={"enabled" if self.use_grad_scaler else "disabled"})'
+        )
 
         base_model = DualModalCADGenerator(config.get('model', {}))
         self.model = self._wrap_model_for_parallel(base_model)
@@ -81,6 +84,34 @@ class Trainer:
         log_cfg = config.get('log', {})
         self.log_dir = log_cfg.get('log_dir', config.get('log_dir', 'runs/dmcad'))
         self.writer = SummaryWriter(self.log_dir)
+
+    def _resolve_precision_mode(self):
+        if 'precision' in self.training_cfg:
+            precision = str(self.training_cfg.get('precision', 'fp32')).lower()
+        else:
+            precision = 'fp16' if bool(self.training_cfg.get('use_amp', False)) else 'fp32'
+        if precision not in {'fp32', 'fp16', 'bf16'}:
+            raise ValueError(f'Unsupported training.precision: {precision}')
+        return precision
+
+    def _configure_precision(self):
+        if self.precision == 'fp32':
+            return False, None, False
+
+        if self.device.type != 'cuda':
+            raise ValueError(f'training.precision={self.precision} requires CUDA, but runtime device is {self.device.type}')
+
+        if self.precision == 'fp16':
+            return True, torch.float16, True
+
+        if not torch.cuda.is_bf16_supported():
+            raise ValueError('training.precision=bf16 requires CUDA BF16 support, but the current device does not support it')
+        return True, torch.bfloat16, False
+
+    def _autocast_context(self):
+        if not self.autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype)
 
     def _build_lr_lambda(self, scheduler_cfg):
         warmup_epochs = max(int(self.training_cfg.get('warmup_epochs', 0)), 0)
@@ -188,7 +219,22 @@ class Trainer:
         gt_hist = (gt_hist / gt_hist.sum().clamp_min(1.0)).cpu().tolist()
         return pred_hist, gt_hist
 
-    def _log_debug_step(self, batch_idx, loss, loss_dict, grad_norm, scaler_scale, pred_hist, gt_hist):
+    def _log_debug_step(
+        self,
+        batch_idx,
+        loss,
+        loss_dict,
+        grad_norm,
+        grad_norm_clipped,
+        scaler_scale,
+        scaler_scale_next,
+        overflow_detected,
+        lr,
+        cmd_logits_abs_max,
+        param_pred_abs_max,
+        pred_hist,
+        gt_hist
+    ):
         if not self.debug_monitor_enabled:
             return
         if (batch_idx + 1) % self.debug_log_every_batches != 0:
@@ -200,7 +246,13 @@ class Trainer:
         self.writer.add_scalar('debug/eos_loss_step', loss_dict['eos_loss'].item(), step)
         self.writer.add_scalar('debug/param_loss_step', loss_dict['param_loss'].item(), step)
         self.writer.add_scalar('debug/grad_norm', grad_norm, step)
+        self.writer.add_scalar('debug/grad_norm_clipped', grad_norm_clipped, step)
         self.writer.add_scalar('debug/grad_scaler_scale', scaler_scale, step)
+        self.writer.add_scalar('debug/grad_scaler_scale_next', scaler_scale_next, step)
+        self.writer.add_scalar('debug/amp_overflow', float(overflow_detected), step)
+        self.writer.add_scalar('debug/lr_step', lr, step)
+        self.writer.add_scalar('debug/cmd_logits_abs_max', cmd_logits_abs_max, step)
+        self.writer.add_scalar('debug/param_pred_abs_max', param_pred_abs_max, step)
 
         for idx, value in enumerate(pred_hist):
             self.writer.add_scalar(f'debug/cmd_pred_frac_{idx}', value, step)
@@ -213,7 +265,9 @@ class Trainer:
             f'[Debug][Epoch {self.epoch} Batch {batch_idx + 1} Step {step}] '
             f'loss={loss.item():.4f} cmd={loss_dict["cmd_loss"].item():.4f} '
             f'eos={loss_dict["eos_loss"].item():.4f} param={loss_dict["param_loss"].item():.4f} '
-            f'grad_norm={grad_norm:.4f} scaler={scaler_scale:.1f} '
+            f'grad_norm={grad_norm:.4f} grad_norm_clipped={grad_norm_clipped:.4f} '
+            f'scaler={scaler_scale:.4f}->{scaler_scale_next:.4f} overflow={int(overflow_detected)} '
+            f'lr={lr:.8f} cmd|max|={cmd_logits_abs_max:.4f} param|max|={param_pred_abs_max:.4f} '
             f'pred_top=cmd{pred_top}:{pred_hist[pred_top]:.3f} '
             f'gt_top=cmd{gt_top}:{gt_hist[gt_top]:.3f}'
         )
@@ -305,7 +359,7 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             forward_start_time = time.perf_counter()
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with self._autocast_context():
                 cmd_logits, param_pred = self.model(
                     images, text_input_ids, text_attention_mask, cad_seq
                 )
@@ -329,31 +383,40 @@ class Trainer:
 
             grad_clip = self.training_cfg.get('gradient_clip', 1.0)
             backward_start_time = time.perf_counter()
-            if self.use_amp:
+            scaler_scale = float(self.scaler.get_scale()) if self.use_grad_scaler else 1.0
+            if self.use_grad_scaler:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                grad_norm_clipped = self._compute_grad_norm()
             else:
                 loss.backward()
                 grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                grad_norm_clipped = self._compute_grad_norm()
             self._sync_profile_cuda()
             backward_time = time.perf_counter() - backward_start_time
 
             optimizer_start_time = time.perf_counter()
-            if self.use_amp:
+            if self.use_grad_scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                scaler_scale_next = float(self.scaler.get_scale())
+                overflow_detected = scaler_scale_next < scaler_scale
             else:
                 self.optimizer.step()
+                scaler_scale_next = 1.0
+                overflow_detected = False
             self._sync_profile_cuda()
             optimizer_time = time.perf_counter() - optimizer_start_time
 
-            scaler_scale = float(self.scaler.get_scale()) if self.use_amp else 1.0
             pred_hist, gt_hist = self._compute_cmd_distribution(cmd_logits, cmd_gt, cad_valid_mask)
+            lr = float(self.optimizer.param_groups[0]['lr'])
+            cmd_logits_abs_max = float(torch.nan_to_num(cmd_logits.detach(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
+            param_pred_abs_max = float(torch.nan_to_num(param_pred.detach(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
 
             total_loss += loss.item()
             cmd_loss_total += loss_dict['cmd_loss'].item()
@@ -378,7 +441,13 @@ class Trainer:
                 loss,
                 loss_dict,
                 grad_norm,
+                grad_norm_clipped,
                 scaler_scale,
+                scaler_scale_next,
+                overflow_detected,
+                lr,
+                cmd_logits_abs_max,
+                param_pred_abs_max,
                 pred_hist,
                 gt_hist
             )
@@ -430,7 +499,7 @@ class Trainer:
             cad_seq = batch['cad_seq'].to(self.device, non_blocking=True)
             cad_valid_mask = batch['cad_valid_mask'].to(self.device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with self._autocast_context():
                 cmd_logits, param_pred = self.model(
                     images, text_input_ids, text_attention_mask, cad_seq
                 )
