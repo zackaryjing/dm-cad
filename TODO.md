@@ -22,8 +22,8 @@ Suggested actions:
 - Keep it configurable with a simple boolean switch in config.
 
 Completion notes:
-- Added `training.use_amp` to the training configs.
-- Enabled AMP in both training and validation paths.
+- Added configurable mixed-precision support to the training configs.
+- Enabled mixed precision in both training and validation paths.
 - Verified with a local WSL smoke run on `gpu0`, `batch_size=4`, `num_workers=2`.
 
 ### 3. Freeze ViT by default
