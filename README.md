@@ -80,6 +80,8 @@ python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/c
 - `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
 - `training.progress_total_epochs`: 可选；仅用于计算 loss curriculum 的训练进度分母。默认等于 `training.num_epochs`
 - `training.precision`: 训练精度模式，支持 `fp32` / `fp16` / `bf16`
+- `optimizer.lr`: 优化器基础学习率；当前训练代码只读取这里的学习率配置
+- `optimizer.weight_decay`: 优化器权重衰减；当前训练代码只读取这里的权重衰减配置
 - `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
 - `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
 - `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`

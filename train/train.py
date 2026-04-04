@@ -66,7 +66,7 @@ class Trainer:
         ).to(self.device)
 
         optimizer_cfg = config.get('optimizer', {})
-        base_lr = optimizer_cfg.get('lr', self.training_cfg.get('lr', 5e-5))
+        base_lr = optimizer_cfg.get('lr', 5e-5)
         self.optimizer = AdamW(
             self.model.parameters(),
             lr=base_lr,

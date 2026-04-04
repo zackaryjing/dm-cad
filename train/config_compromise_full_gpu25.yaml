@@ -13,8 +13,6 @@ model:
 training:
   batch_size: 128
   num_epochs: 200
-  lr: 2.0e-05
-  weight_decay: 0.01
   warmup_epochs: 5
   gradient_clip: 0.5
   num_workers: 24

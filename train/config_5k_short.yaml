@@ -13,8 +13,6 @@ training:
   num_epochs: 1
   max_train_batches: 100
   max_val_batches: 25
-  lr: 5.0e-05
-  weight_decay: 0.01
   warmup_epochs: 0
   gradient_clip: 1.0
   num_workers: 2
