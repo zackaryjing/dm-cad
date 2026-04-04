@@ -256,7 +256,7 @@ Files:
 - `train/config_5k_short.yaml`
 
 Changes:
-- Added configurable AMP support with `training.use_amp`.
+- Added configurable training precision support with `training.precision`.
 - Enabled AMP in both training and validation.
 
 
@@ -354,7 +354,7 @@ Environment:
 - Python: `/home/jing/allprojects/pythonenvironment/dmcad/bin/python`
 - GPU visibility: `CUDA_VISIBLE_DEVICES=0`
 - Config: `train/config_5k_short.yaml`
-- Effective settings: single GPU, `batch_size=4`, `num_workers=2`, `use_amp=true`, `freeze_vit=true`
+- Effective settings: single GPU, `batch_size=4`, `num_workers=2`, `precision=bf16`, `freeze_vit=true`
 
 Observed result:
 - Training completed for the bounded 1-epoch short run.

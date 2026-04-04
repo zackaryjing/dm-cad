@@ -487,7 +487,7 @@ training:
   num_epochs: 80
   lr: 5.0e-05
   gradient_clip: 1.0
-  use_amp: true
+  precision: bf16
 
 data:
   img_size: 224

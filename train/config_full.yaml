@@ -18,7 +18,9 @@ training:
   warmup_epochs: 5
   gradient_clip: 0.5
   num_workers: 24
-  use_amp: true
+  precision: bf16
+  debug_monitor_enabled: true
+  debug_log_every_batches: 10
 
 loss:
   cmd_weight: 1.0

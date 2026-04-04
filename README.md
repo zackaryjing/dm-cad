@@ -61,11 +61,25 @@ python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/c
 python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/checkpoints/epoch_10.pth --no-resume-in-place
 ```
 
+`--resume` 的两种模式：
+- 默认行为：原地续训。新的 checkpoint、TensorBoard events、`config.resolved.yaml` 继续写入该 checkpoint 所在的 run 目录。
+- `--resume --no-resume-in-place`：新建 run。会像一次新的训练任务那样创建独立目录，但模型参数从给定 checkpoint 初始化。
+
+`--resume --no-resume-in-place` 时会保留/重置的内容：
+- 保留：`model_state_dict`
+- 重置：`optimizer_state_dict`
+- 重置：`scheduler_state_dict`
+- 重置：`epoch` 计数，从 0 开始新的 run
+- 重置：`best_val_loss`
+
+这适合你修改了学习率、batch size、scheduler、训练轮数等配置，但仍想把旧 checkpoint 作为参数初始化起点的场景。
+
 **配置说明** (`train/config.yaml`):
 - `data.data_root`: 数据集根目录 (默认：`datasets/dataset_v1`)
 - `data.train_ids_file`: 训练集 ids 文件 (**相对于 data_root**)
 - `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
 - `training.progress_total_epochs`: 可选；仅用于计算 loss curriculum 的训练进度分母。默认等于 `training.num_epochs`
+- `training.precision`: 训练精度模式，支持 `fp32` / `fp16` / `bf16`
 - `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
 - `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
 - `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`
@@ -250,6 +264,12 @@ training:
 - `progress_total_epochs` **不会**改变学习率调度器的总 epoch
 - `progress_total_epochs` **不会**改变 checkpoint 保存频率
 - `progress_total_epochs` **不会**改变训练循环实际跑多少个 epoch
+
+### 训练精度模式
+
+- `training.precision: fp32`：最稳，但速度最慢
+- `training.precision: fp16`：速度快，但更容易出现数值不稳定
+- `training.precision: bf16`：在支持 BF16 的 CUDA 设备上通常兼顾速度和稳定性；当前默认推荐这个模式
 - 它当前只影响 loss curriculum，不影响 optimizer / scheduler 的其它行为
 
 ### 命令类型不匹配

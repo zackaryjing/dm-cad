@@ -18,7 +18,7 @@ training:
   warmup_epochs: 5
   gradient_clip: 0.5
   num_workers: 24
-  use_amp: true
+  precision: bf16
 
 loss:
   cmd_weight: 1.0
