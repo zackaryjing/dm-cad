@@ -19,6 +19,7 @@ training:
   precision: bf16
   debug_monitor_enabled: true
   debug_log_every_batches: 10
+  debug_fail_on_nonfinite: true
 
 loss:
   cmd_weight: 1.0

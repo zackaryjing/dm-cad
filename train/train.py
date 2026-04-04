@@ -38,6 +38,7 @@ class Trainer:
         self.profile_warmup_steps = max(int(self.training_cfg.get('profile_warmup_steps', 5)), 0)
         self.debug_monitor_enabled = bool(self.training_cfg.get('debug_monitor_enabled', False))
         self.debug_log_every_batches = max(int(self.training_cfg.get('debug_log_every_batches', 50)), 1)
+        self.debug_fail_on_nonfinite = bool(self.training_cfg.get('debug_fail_on_nonfinite', False))
         self.global_train_step = 0
 
         print(
@@ -198,6 +199,100 @@ class Trainer:
             total += grad.float().pow(2).sum().item()
         return math.sqrt(total) if total > 0 else 0.0
 
+    def _tensor_finite_stats(self, tensor):
+        detached = tensor.detach()
+        finite_mask = torch.isfinite(detached)
+        finite_ratio = float(finite_mask.float().mean().item()) if detached.numel() > 0 else 1.0
+        nan_count = int(torch.isnan(detached).sum().item())
+        posinf_count = int(torch.isposinf(detached).sum().item())
+        neginf_count = int(torch.isneginf(detached).sum().item())
+        if finite_mask.any():
+            abs_max = float(detached[finite_mask].abs().max().item())
+        else:
+            abs_max = float('nan')
+        return {
+            'finite_ratio': finite_ratio,
+            'nan_count': nan_count,
+            'posinf_count': posinf_count,
+            'neginf_count': neginf_count,
+            'abs_max': abs_max,
+            'all_finite': nan_count == 0 and posinf_count == 0 and neginf_count == 0,
+        }
+
+    def _scan_named_tensors_for_nonfinite(self, named_tensors):
+        issues = []
+        for name, tensor in named_tensors:
+            if tensor is None:
+                continue
+            stats = self._tensor_finite_stats(tensor)
+            if stats['all_finite']:
+                continue
+            issues.append((name, stats))
+        return issues
+
+    def _format_nonfinite_issues(self, issues, limit=3):
+        if not issues:
+            return 'none'
+        parts = []
+        for name, stats in issues[:limit]:
+            parts.append(
+                f'{name}(nan={stats["nan_count"]}, +inf={stats["posinf_count"]}, '
+                f'-inf={stats["neginf_count"]}, finite_ratio={stats["finite_ratio"]:.6f})'
+            )
+        if len(issues) > limit:
+            parts.append(f'... +{len(issues) - limit} more')
+        return '; '.join(parts)
+
+    def _debug_check_nonfinite_stage(self, stage, batch_idx, loss, lr):
+        if not self.debug_monitor_enabled:
+            return
+        param_issues = self._scan_named_tensors_for_nonfinite(self._model_to_save().named_parameters())
+        grad_issues = self._scan_named_tensors_for_nonfinite(
+            (f'{name}.grad', param.grad) for name, param in self._model_to_save().named_parameters()
+        )
+        if not param_issues and not grad_issues:
+            return
+
+        print(
+            f'[NonFiniteStage][Epoch {self.epoch} Batch {batch_idx + 1} Step {self.global_train_step}] '
+            f'stage={stage} loss={loss.item():.4f} lr={lr:.8f} '
+            f'params={self._format_nonfinite_issues(param_issues)} '
+            f'grads={self._format_nonfinite_issues(grad_issues)}'
+        )
+        if self.debug_fail_on_nonfinite:
+            raise RuntimeError(
+                f'Non-finite tensors detected at stage={stage} epoch={self.epoch} batch={batch_idx + 1} step={self.global_train_step}'
+            )
+
+    def _maybe_fail_on_nonfinite(self, batch_idx, loss, lr, cmd_stats, param_stats, param_issues, grad_issues):
+        if not self.debug_monitor_enabled:
+            return
+        has_issue = (
+            not cmd_stats['all_finite'] or
+            not param_stats['all_finite'] or
+            bool(param_issues) or
+            bool(grad_issues)
+        )
+        if not has_issue:
+            return
+
+        print(
+            f'[NonFinite][Epoch {self.epoch} Batch {batch_idx + 1} Step {self.global_train_step}] '
+            f'loss={loss.item():.4f} lr={lr:.8f} '
+            f'cmd_logits(nan={cmd_stats["nan_count"]}, +inf={cmd_stats["posinf_count"]}, '
+            f'-inf={cmd_stats["neginf_count"]}, finite_ratio={cmd_stats["finite_ratio"]:.6f}, '
+            f'abs_max={cmd_stats["abs_max"]}) '
+            f'param_pred(nan={param_stats["nan_count"]}, +inf={param_stats["posinf_count"]}, '
+            f'-inf={param_stats["neginf_count"]}, finite_ratio={param_stats["finite_ratio"]:.6f}, '
+            f'abs_max={param_stats["abs_max"]}) '
+            f'params={self._format_nonfinite_issues(param_issues)} '
+            f'grads={self._format_nonfinite_issues(grad_issues)}'
+        )
+        if self.debug_fail_on_nonfinite:
+            raise RuntimeError(
+                f'Non-finite tensors detected at epoch={self.epoch} batch={batch_idx + 1} step={self.global_train_step}'
+            )
+
     def _compute_cmd_distribution(self, cmd_logits, cmd_gt, valid_mask):
         valid_mask = valid_mask.bool()
         if not valid_mask.any():
@@ -227,8 +322,10 @@ class Trainer:
         scaler_scale_next,
         overflow_detected,
         lr,
-        cmd_logits_abs_max,
-        param_pred_abs_max,
+        cmd_stats,
+        param_stats,
+        param_issues,
+        grad_issues,
         pred_hist,
         gt_hist
     ):
@@ -248,8 +345,18 @@ class Trainer:
         self.writer.add_scalar('debug/grad_scaler_scale_next', scaler_scale_next, step)
         self.writer.add_scalar('debug/amp_overflow', float(overflow_detected), step)
         self.writer.add_scalar('debug/lr_step', lr, step)
-        self.writer.add_scalar('debug/cmd_logits_abs_max', cmd_logits_abs_max, step)
-        self.writer.add_scalar('debug/param_pred_abs_max', param_pred_abs_max, step)
+        self.writer.add_scalar('debug/cmd_logits_abs_max', cmd_stats['abs_max'], step)
+        self.writer.add_scalar('debug/param_pred_abs_max', param_stats['abs_max'], step)
+        self.writer.add_scalar('debug/cmd_logits_finite_ratio', cmd_stats['finite_ratio'], step)
+        self.writer.add_scalar('debug/param_pred_finite_ratio', param_stats['finite_ratio'], step)
+        self.writer.add_scalar('debug/cmd_logits_nan_count', cmd_stats['nan_count'], step)
+        self.writer.add_scalar('debug/cmd_logits_posinf_count', cmd_stats['posinf_count'], step)
+        self.writer.add_scalar('debug/cmd_logits_neginf_count', cmd_stats['neginf_count'], step)
+        self.writer.add_scalar('debug/param_pred_nan_count', param_stats['nan_count'], step)
+        self.writer.add_scalar('debug/param_pred_posinf_count', param_stats['posinf_count'], step)
+        self.writer.add_scalar('debug/param_pred_neginf_count', param_stats['neginf_count'], step)
+        self.writer.add_scalar('debug/nonfinite_param_tensor_count', len(param_issues), step)
+        self.writer.add_scalar('debug/nonfinite_grad_tensor_count', len(grad_issues), step)
 
         for idx, value in enumerate(pred_hist):
             self.writer.add_scalar(f'debug/cmd_pred_frac_{idx}', value, step)
@@ -264,7 +371,9 @@ class Trainer:
             f'eos={loss_dict["eos_loss"].item():.4f} param={loss_dict["param_loss"].item():.4f} '
             f'grad_norm={grad_norm:.4f} grad_norm_clipped={grad_norm_clipped:.4f} '
             f'scaler={scaler_scale:.4f}->{scaler_scale_next:.4f} overflow={int(overflow_detected)} '
-            f'lr={lr:.8f} cmd|max|={cmd_logits_abs_max:.4f} param|max|={param_pred_abs_max:.4f} '
+            f'lr={lr:.8f} cmd|max|={cmd_stats["abs_max"]:.4f} param|max|={param_stats["abs_max"]:.4f} '
+            f'cmd_finite={cmd_stats["finite_ratio"]:.6f} param_finite={param_stats["finite_ratio"]:.6f} '
+            f'bad_params={len(param_issues)} bad_grads={len(grad_issues)} '
             f'pred_top=cmd{pred_top}:{pred_hist[pred_top]:.3f} '
             f'gt_top=cmd{gt_top}:{gt_hist[gt_top]:.3f}'
         )
@@ -370,6 +479,12 @@ class Trainer:
                 )
             self._sync_profile_cuda()
             forward_time = time.perf_counter() - forward_start_time
+            self._debug_check_nonfinite_stage(
+                stage='after_forward',
+                batch_idx=batch_idx,
+                loss=loss,
+                lr=float(self.optimizer.param_groups[0]['lr'])
+            )
 
             if not torch.isfinite(loss):
                 skipped_batches += 1
@@ -384,15 +499,39 @@ class Trainer:
             if self.use_grad_scaler:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
+                self._debug_check_nonfinite_stage(
+                    stage='after_backward_unscale',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                self._debug_check_nonfinite_stage(
+                    stage='after_clip',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm_clipped = self._compute_grad_norm()
             else:
                 loss.backward()
+                self._debug_check_nonfinite_stage(
+                    stage='after_backward',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                self._debug_check_nonfinite_stage(
+                    stage='after_clip',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm_clipped = self._compute_grad_norm()
             self._sync_profile_cuda()
             backward_time = time.perf_counter() - backward_start_time
@@ -407,13 +546,32 @@ class Trainer:
                 self.optimizer.step()
                 scaler_scale_next = 1.0
                 overflow_detected = False
+            self._debug_check_nonfinite_stage(
+                stage='after_optimizer_step',
+                batch_idx=batch_idx,
+                loss=loss,
+                lr=float(self.optimizer.param_groups[0]['lr'])
+            )
             self._sync_profile_cuda()
             optimizer_time = time.perf_counter() - optimizer_start_time
 
             pred_hist, gt_hist = self._compute_cmd_distribution(cmd_logits, cmd_gt, cad_valid_mask)
             lr = float(self.optimizer.param_groups[0]['lr'])
-            cmd_logits_abs_max = float(torch.nan_to_num(cmd_logits.detach(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
-            param_pred_abs_max = float(torch.nan_to_num(param_pred.detach(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
+            cmd_stats = self._tensor_finite_stats(cmd_logits)
+            param_stats = self._tensor_finite_stats(param_pred)
+            param_issues = self._scan_named_tensors_for_nonfinite(self._model_to_save().named_parameters())
+            grad_issues = self._scan_named_tensors_for_nonfinite(
+                (f'{name}.grad', param.grad) for name, param in self._model_to_save().named_parameters()
+            )
+            self._maybe_fail_on_nonfinite(
+                batch_idx,
+                loss,
+                lr,
+                cmd_stats,
+                param_stats,
+                param_issues,
+                grad_issues
+            )
 
             total_loss += loss.item()
             cmd_loss_total += loss_dict['cmd_loss'].item()
@@ -443,8 +601,10 @@ class Trainer:
                 scaler_scale_next,
                 overflow_detected,
                 lr,
-                cmd_logits_abs_max,
-                param_pred_abs_max,
+                cmd_stats,
+                param_stats,
+                param_issues,
+                grad_issues,
                 pred_hist,
                 gt_hist
             )

@@ -3,6 +3,9 @@
 基于设计文档 3.6 节
 """
 
+from contextlib import nullcontext
+
+import torch
 import torch.nn as nn
 
 from .cad_decoder import CADDecoder
@@ -69,12 +72,12 @@ class DualModalCADGenerator(nn.Module):
     def forward(self, images, text_input_ids, text_attention_mask, tgt_cad_seq=None):
         """前向传播"""
         z_fused = self._encode_modalities(images, text_input_ids, text_attention_mask)
-        return self.cad_decoder(z_fused, tgt_cad_seq, training=self.training)
+        return self._decode_in_full_precision(z_fused, tgt_cad_seq)
 
     def generate(self, images, text_input_ids, text_attention_mask, max_steps=120):
         """推理模式 - 生成 CAD 序列"""
         z_fused = self._encode_modalities(images, text_input_ids, text_attention_mask)
-        return self.cad_decoder.generate(z_fused, max_steps=max_steps)
+        return self._generate_in_full_precision(z_fused, max_steps=max_steps)
 
     def encode_images(self, images):
         """仅图像编码"""
@@ -93,3 +96,18 @@ class DualModalCADGenerator(nn.Module):
         z_img = self.encode_images(images)
         z_txt = self.encode_text(text_input_ids, text_attention_mask)
         return self.modal_fusion(z_img, z_txt)
+
+    def _full_precision_decoder_context(self, device_type):
+        if device_type != 'cuda':
+            return nullcontext()
+        return torch.autocast(device_type=device_type, enabled=False)
+
+    def _decode_in_full_precision(self, z_fused, tgt_cad_seq=None):
+        with self._full_precision_decoder_context(z_fused.device.type):
+            z_fused_fp32 = z_fused.float()
+            tgt_seq_fp32 = tgt_cad_seq.float() if tgt_cad_seq is not None else None
+            return self.cad_decoder(z_fused_fp32, tgt_seq_fp32, training=self.training)
+
+    def _generate_in_full_precision(self, z_fused, max_steps=120):
+        with self._full_precision_decoder_context(z_fused.device.type):
+            return self.cad_decoder.generate(z_fused.float(), max_steps=max_steps)

@@ -105,7 +105,7 @@ class CADDecoder(nn.Module):
 
     def _build_causal_mask(self, seq_len, device):
         return torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=device),
+            torch.ones((seq_len, seq_len), device=device, dtype=torch.bool),
             diagonal=1
         )
 
