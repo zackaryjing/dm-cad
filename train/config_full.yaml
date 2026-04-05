@@ -11,13 +11,13 @@ model:
   freeze_vit: true
 
 training:
-  batch_size: 384
+  batch_size: 512
   num_epochs: 300
   warmup_epochs: 5
   gradient_clip: 0.5
   num_workers: 24
   precision: bf16
-  debug_monitor_enabled: true
+  debug_monitor_enabled: false
   debug_log_every_batches: 10
   debug_fail_on_nonfinite: true
 
@@ -64,6 +64,6 @@ log:
 
 device:
   type: cuda
-  visible_devices: [2,5]
+  visible_devices: [1,2]
   use_data_parallel: true
   output_device: 0
