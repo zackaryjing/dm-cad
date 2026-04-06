@@ -79,9 +79,11 @@ python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/c
 - `data.train_ids_file`: 训练集 ids 文件 (**相对于 data_root**)
 - `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
 - `training.progress_total_epochs`: 可选；仅用于计算 loss curriculum 的训练进度分母。默认等于 `training.num_epochs`
+- `training.epoch_offset`: 可选；用于从中间 checkpoint 开新 run 时，指定这次训练在“全局 epoch”上的起点。它会同时影响 loss curriculum、学习率调度、TensorBoard 横轴和定期 checkpoint 编号
 - `training.precision`: 训练精度模式，支持 `fp32` / `fp16` / `bf16`
 - `optimizer.lr`: 优化器基础学习率；当前训练代码只读取这里的学习率配置
 - `optimizer.weight_decay`: 优化器权重衰减；当前训练代码只读取这里的权重衰减配置
+- `loss.param_scale`: 参数损失归一化尺度。当前参数值量级较大时，应设置到与数据尺度接近的值，避免 `tanh(param / param_scale)` 过早饱和
 - `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
 - `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
 - `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`
@@ -267,12 +269,50 @@ training:
 - `progress_total_epochs` **不会**改变 checkpoint 保存频率
 - `progress_total_epochs` **不会**改变训练循环实际跑多少个 epoch
 
+### 从中间 Epoch 开新 Run
+
+如果你想从某个旧 checkpoint 初始化参数，但新建一个独立 run 目录继续实验，同时又希望：
+
+- loss curriculum 不要从 epoch 0 重新开始
+- 学习率调度继续沿用旧训练已经走过的 epoch 进度
+- TensorBoard 和 `epoch_XX.pth` 的编号保持全局 epoch 一致
+
+可以在配置里设置 `training.epoch_offset`，然后配合 `--resume --no-resume-in-place` 使用。
+
+例如，从 `epoch_40.pth` 开一个新 run：
+
+```yaml
+training:
+  num_epochs: 300
+  epoch_offset: 40
+```
+
+```bash
+python train_main.py \
+  --config train/config_full.yaml \
+  --resume runs/dmcad/<old_run>/checkpoints/epoch_40.pth \
+  --no-resume-in-place
+```
+
+这时新的 run 会：
+
+- 从旧 checkpoint 的模型参数开始
+- 创建新的日志和 checkpoint 目录
+- 但内部把当前训练视为“全局第 40 轮之后继续训练”
+- 本地实际只会再跑 `num_epochs - epoch_offset` 个 epoch
+
 ### 训练精度模式
 
 - `training.precision: fp32`：最稳，但速度最慢
 - `training.precision: fp16`：速度快，但更容易出现数值不稳定
 - `training.precision: bf16`：在支持 BF16 的 CUDA 设备上通常兼顾速度和稳定性；当前默认推荐这个模式
 - 它当前只影响 loss curriculum，不影响 optimizer / scheduler 的其它行为
+
+### 参数指标
+
+- `val/param_acc`：原始参数空间中的严格绝对误差指标，定义为 `abs(pred - gt) < 0.1`
+- `val/param_acc_abs_1.0`：原始参数空间中的较宽松绝对误差指标，定义为 `abs(pred - gt) < 1.0`
+- `val/param_acc_norm_0.02`：按 `loss.param_scale` 归一化后的误差指标，定义为 `abs(pred - gt) / param_scale < 0.02`
 
 ### 命令类型不匹配
 - 模型使用 **6 种命令类型** (DeepCAD 原始格式)

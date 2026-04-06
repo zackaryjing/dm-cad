@@ -28,6 +28,7 @@ class Trainer:
         self.requested_device = device
         self.device_cfg = config.get('device', {})
         self.training_cfg = config.get('training', {})
+        self.epoch_offset = max(int(self.training_cfg.get('epoch_offset', 0)), 0)
         self.configured_visible_device_count = get_configured_visible_device_count(config)
         self.device = self._resolve_runtime_device(device)
         self.precision = self._resolve_precision_mode()
@@ -129,13 +130,18 @@ class Trainer:
 
         return lr_lambda
 
+    def _effective_epoch(self, epoch=None):
+        if epoch is None:
+            epoch = self.epoch
+        return self.epoch_offset + epoch
+
     def _training_progress(self, batch_idx, total_batches):
         total_epochs = max(int(self.training_cfg.get('progress_total_epochs', self.training_cfg.get('num_epochs', 1))), 1)
         epoch_progress = (batch_idx + 1) / max(total_batches, 1)
-        return min((self.epoch + epoch_progress) / total_epochs, 1.0)
+        return min((self._effective_epoch() + epoch_progress) / total_epochs, 1.0)
 
     def _apply_lr_factor(self, epoch):
-        factor = self.lr_lambda(epoch)
+        factor = self.lr_lambda(self._effective_epoch(epoch))
         for group, base_lr in zip(self.optimizer.param_groups, self.scheduler.base_lrs):
             group['lr'] = base_lr * factor
 
@@ -179,8 +185,9 @@ class Trainer:
         count = timing_stats['count']
         avg = {key: value / count for key, value in timing_stats.items() if key != 'count'}
         total = avg['step_time'] if avg['step_time'] > 0 else 1e-12
+        effective_epoch = self._effective_epoch(epoch)
         print(
-            f'[Timing][Epoch {epoch}] averaged over {count} steps '
+            f'[Timing][Epoch {effective_epoch}] averaged over {count} steps '
             f'(after {self.profile_warmup_steps} warmup steps): '
             f'data={avg["data_time"] * 1000:.1f}ms ({avg["data_time"] / total * 100:.1f}%), '
             f'h2d={avg["h2d_time"] * 1000:.1f}ms ({avg["h2d_time"] / total * 100:.1f}%), '
@@ -254,14 +261,14 @@ class Trainer:
             return
 
         print(
-            f'[NonFiniteStage][Epoch {self.epoch} Batch {batch_idx + 1} Step {self.global_train_step}] '
+            f'[NonFiniteStage][Epoch {self._effective_epoch()} Batch {batch_idx + 1} Step {self.global_train_step}] '
             f'stage={stage} loss={loss.item():.4f} lr={lr:.8f} '
             f'params={self._format_nonfinite_issues(param_issues)} '
             f'grads={self._format_nonfinite_issues(grad_issues)}'
         )
         if self.debug_fail_on_nonfinite:
             raise RuntimeError(
-                f'Non-finite tensors detected at stage={stage} epoch={self.epoch} batch={batch_idx + 1} step={self.global_train_step}'
+                f'Non-finite tensors detected at stage={stage} effective_epoch={self._effective_epoch()} batch={batch_idx + 1} step={self.global_train_step}'
             )
 
     def _maybe_fail_on_nonfinite(self, batch_idx, loss, lr, cmd_stats, param_stats, param_issues, grad_issues):
@@ -277,7 +284,7 @@ class Trainer:
             return
 
         print(
-            f'[NonFinite][Epoch {self.epoch} Batch {batch_idx + 1} Step {self.global_train_step}] '
+            f'[NonFinite][Epoch {self._effective_epoch()} Batch {batch_idx + 1} Step {self.global_train_step}] '
             f'loss={loss.item():.4f} lr={lr:.8f} '
             f'cmd_logits(nan={cmd_stats["nan_count"]}, +inf={cmd_stats["posinf_count"]}, '
             f'-inf={cmd_stats["neginf_count"]}, finite_ratio={cmd_stats["finite_ratio"]:.6f}, '
@@ -290,7 +297,7 @@ class Trainer:
         )
         if self.debug_fail_on_nonfinite:
             raise RuntimeError(
-                f'Non-finite tensors detected at epoch={self.epoch} batch={batch_idx + 1} step={self.global_train_step}'
+                f'Non-finite tensors detected at effective_epoch={self._effective_epoch()} batch={batch_idx + 1} step={self.global_train_step}'
             )
 
     def _compute_cmd_distribution(self, cmd_logits, cmd_gt, valid_mask):
@@ -366,7 +373,7 @@ class Trainer:
         pred_top = max(range(len(pred_hist)), key=lambda i: pred_hist[i]) if pred_hist else -1
         gt_top = max(range(len(gt_hist)), key=lambda i: gt_hist[i]) if gt_hist else -1
         print(
-            f'[Debug][Epoch {self.epoch} Batch {batch_idx + 1} Step {step}] '
+            f'[Debug][Epoch {self._effective_epoch()} Batch {batch_idx + 1} Step {step}] '
             f'loss={loss.item():.4f} cmd={loss_dict["cmd_loss"].item():.4f} '
             f'eos={loss_dict["eos_loss"].item():.4f} param={loss_dict["param_loss"].item():.4f} '
             f'grad_norm={grad_norm:.4f} grad_norm_clipped={grad_norm_clipped:.4f} '
@@ -444,7 +451,7 @@ class Trainer:
 
         max_batches = self.training_cfg.get('max_train_batches')
         effective_batches = min(n_batches, max_batches) if max_batches else n_batches
-        pbar = tqdm(dataloader, desc=f'Epoch {self.epoch}', total=effective_batches)
+        pbar = tqdm(dataloader, desc=f'Epoch {self._effective_epoch()}', total=effective_batches)
 
         processed_batches = 0
         skipped_batches = 0
@@ -641,6 +648,8 @@ class Trainer:
         total_loss = 0.0
         cmd_acc_total = 0.0
         param_acc_total = 0.0
+        param_acc_abs_1_total = 0.0
+        param_acc_norm_002_total = 0.0
         n_batches = len(dataloader)
         if n_batches == 0:
             raise ValueError('Validation dataloader is empty')
@@ -679,8 +688,10 @@ class Trainer:
                 cmd_mask = self.criterion.cmd_param_mask.to(param_error.device)[cmd_gt.clamp(min=0, max=self.criterion.cmd_param_mask.shape[0] - 1)]
                 combined_mask = cad_valid_mask.unsqueeze(-1) & cmd_mask
                 if combined_mask.any():
-                    param_correct = (param_error < 0.1)[combined_mask].float().mean()
-                    param_acc_total += param_correct.item()
+                    param_acc_total += (param_error < 0.1)[combined_mask].float().mean().item()
+                    param_acc_abs_1_total += (param_error < 1.0)[combined_mask].float().mean().item()
+                    param_error_norm = param_error / max(float(self.criterion.param_scale), 1e-6)
+                    param_acc_norm_002_total += (param_error_norm < 0.02)[combined_mask].float().mean().item()
 
             if max_batches and processed_batches >= max_batches:
                 break
@@ -688,30 +699,42 @@ class Trainer:
         return {
             'loss': total_loss / processed_batches,
             'cmd_acc': cmd_acc_total / processed_batches,
-            'param_acc': param_acc_total / processed_batches
+            'param_acc': param_acc_total / processed_batches,
+            'param_acc_abs_1.0': param_acc_abs_1_total / processed_batches,
+            'param_acc_norm_0.02': param_acc_norm_002_total / processed_batches,
         }
 
     def train(self, train_loader, val_loader, num_epochs):
         """完整训练循环"""
-        for epoch in range(self.epoch, num_epochs):
+        local_num_epochs = max(num_epochs - self.epoch_offset, 0)
+        if self.epoch >= local_num_epochs:
+            print(
+                f'Current local epoch {self.epoch} already reached configured training limit '
+                f'(num_epochs={num_epochs}, epoch_offset={self.epoch_offset}). Nothing to do.'
+            )
+            self.writer.close()
+            return
+
+        for epoch in range(self.epoch, local_num_epochs):
             self.epoch = epoch
+            effective_epoch = self._effective_epoch(epoch)
             self._apply_lr_factor(epoch)
-            self.scheduler.last_epoch = epoch
+            self.scheduler.last_epoch = effective_epoch
             start_time = time.time()
 
             train_metrics = self.train_one_epoch(train_loader)
             val_metrics = self.evaluate(val_loader)
-            self._log_metrics(train_metrics, val_metrics, epoch)
+            self._log_metrics(train_metrics, val_metrics, effective_epoch)
 
             if val_metrics['loss'] < self.best_val_loss:
                 self.best_val_loss = val_metrics['loss']
                 self.save_checkpoint('best.pth')
 
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f'epoch_{epoch + 1}.pth')
+            if (effective_epoch + 1) % 10 == 0:
+                self.save_checkpoint(f'epoch_{effective_epoch + 1}.pth')
 
             elapsed = time.time() - start_time
-            print(f'Epoch {epoch}: train_loss={train_metrics["loss"]:.4f}, '
+            print(f'Epoch {effective_epoch}: train_loss={train_metrics["loss"]:.4f}, '
                   f'val_loss={val_metrics["loss"]:.4f}, time={elapsed:.1f}s')
 
         self.writer.close()
@@ -729,6 +752,7 @@ class Trainer:
         checkpoint_path = os.path.join(self.log_dir, 'checkpoints', filename)
         torch.save({
             'epoch': self.epoch,
+            'effective_epoch': self._effective_epoch(),
             'model_state_dict': self._model_to_save().state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
