@@ -65,6 +65,7 @@ class Trainer:
             param_curriculum_start=loss_cfg.get('param_curriculum_start', 0.1),
             param_curriculum_end=loss_cfg.get('param_curriculum_end', 0.6),
             param_loss_cap=loss_cfg.get('param_loss_cap', 1.0),
+            param_huber_delta=loss_cfg.get('param_huber_delta', 0.02),
         ).to(self.device)
 
         optimizer_cfg = config.get('optimizer', {})

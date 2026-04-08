@@ -6,7 +6,7 @@
 - 分层目标：结构、终止、参数三部分独立建模
 - 参数损失按训练进度逐步增强，避免早期回归目标主导
 - 参数损失按 token 归一化，避免高维命令主导
-- 对数值异常和极端误差进行抑制，降低 NaN 风险
+- 参数损失直接在归一化空间中计算 Huber，减少不必要的压缩失真
 """
 
 import torch
@@ -40,6 +40,7 @@ class CADLoss(nn.Module):
         param_curriculum_start=0.1,
         param_curriculum_end=0.6,
         param_loss_cap=1.0,
+        param_huber_delta=0.02,
     ):
         super().__init__()
         self.cmd_weight = cmd_weight
@@ -52,6 +53,7 @@ class CADLoss(nn.Module):
         self.param_curriculum_start = float(param_curriculum_start)
         self.param_curriculum_end = float(param_curriculum_end)
         self.param_loss_cap = max(float(param_loss_cap), 1e-6)
+        self.param_huber_delta = max(float(param_huber_delta), 1e-6)
 
         self.register_buffer('cmd_param_mask', CMD_PARAM_MASK)
         default_class_weights = torch.tensor([1.0, 1.1, 1.0, 1.5, 1.25, 1.15], dtype=torch.float32)
@@ -155,15 +157,15 @@ class CADLoss(nn.Module):
         safe_param_pred = torch.nan_to_num(param_pred, nan=0.0, posinf=1e4, neginf=-1e4)
         safe_param_gt = torch.nan_to_num(param_gt, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        pred_norm = torch.tanh(safe_param_pred / self.param_scale)
-        gt_norm = torch.tanh(safe_param_gt / self.param_scale)
-        residual = pred_norm - gt_norm
-
-        abs_residual = residual.abs()
-        pseudo_huber = torch.sqrt(1.0 + abs_residual.square()) - 1.0
-        bounded_loss = 1.0 - torch.exp(-pseudo_huber)
-        bounded_loss = torch.clamp(bounded_loss, max=self.param_loss_cap)
-
+        pred_norm = safe_param_pred / self.param_scale
+        gt_norm = safe_param_gt / self.param_scale
+        huber = F.huber_loss(
+            pred_norm,
+            gt_norm,
+            reduction='none',
+            delta=self.param_huber_delta
+        )
+        bounded_loss = torch.clamp(huber, max=self.param_loss_cap)
         masked_loss = bounded_loss * combined_mask.float()
         token_param_count = combined_mask.sum(dim=-1)
         token_loss = masked_loss.sum(dim=-1) / token_param_count.clamp_min(1).float()
