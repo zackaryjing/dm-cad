@@ -28,6 +28,7 @@ class Trainer:
         self.requested_device = device
         self.device_cfg = config.get('device', {})
         self.training_cfg = config.get('training', {})
+        self.epoch_offset = max(int(self.training_cfg.get('epoch_offset', 0)), 0)
         self.configured_visible_device_count = get_configured_visible_device_count(config)
         self.device = self._resolve_runtime_device(device)
         self.precision = self._resolve_precision_mode()
@@ -38,6 +39,7 @@ class Trainer:
         self.profile_warmup_steps = max(int(self.training_cfg.get('profile_warmup_steps', 5)), 0)
         self.debug_monitor_enabled = bool(self.training_cfg.get('debug_monitor_enabled', False))
         self.debug_log_every_batches = max(int(self.training_cfg.get('debug_log_every_batches', 50)), 1)
+        self.debug_fail_on_nonfinite = bool(self.training_cfg.get('debug_fail_on_nonfinite', False))
         self.global_train_step = 0
 
         print(
@@ -52,17 +54,12 @@ class Trainer:
 
         loss_cfg = config.get('loss', {})
         self.criterion = CADLoss(
-            cmd_weight=loss_cfg.get('cmd_weight', 1.0),
-            eos_weight=loss_cfg.get('eos_weight', 0.5),
+            cmd_weight=loss_cfg.get('cmd_weight', 0.5),
             param_weight=loss_cfg.get('param_weight', 0.5),
             use_cmd_mask=loss_cfg.get('use_cmd_mask', True),
-            eos_token_id=loss_cfg.get('eos_token_id', 3),
             label_smoothing=loss_cfg.get('label_smoothing', 0.05),
             class_weights=loss_cfg.get('class_weights'),
-            param_scale=loss_cfg.get('param_scale', 1.0),
-            param_curriculum_start=loss_cfg.get('param_curriculum_start', 0.1),
-            param_curriculum_end=loss_cfg.get('param_curriculum_end', 0.6),
-            param_loss_cap=loss_cfg.get('param_loss_cap', 1.0),
+            n_param_bins=loss_cfg.get('n_param_bins', 256),
         ).to(self.device)
 
         optimizer_cfg = config.get('optimizer', {})
@@ -131,13 +128,18 @@ class Trainer:
 
         return lr_lambda
 
+    def _effective_epoch(self, epoch=None):
+        if epoch is None:
+            epoch = self.epoch
+        return self.epoch_offset + epoch
+
     def _training_progress(self, batch_idx, total_batches):
         total_epochs = max(int(self.training_cfg.get('progress_total_epochs', self.training_cfg.get('num_epochs', 1))), 1)
         epoch_progress = (batch_idx + 1) / max(total_batches, 1)
-        return min((self.epoch + epoch_progress) / total_epochs, 1.0)
+        return min((self._effective_epoch() + epoch_progress) / total_epochs, 1.0)
 
     def _apply_lr_factor(self, epoch):
-        factor = self.lr_lambda(epoch)
+        factor = self.lr_lambda(self._effective_epoch(epoch))
         for group, base_lr in zip(self.optimizer.param_groups, self.scheduler.base_lrs):
             group['lr'] = base_lr * factor
 
@@ -181,8 +183,9 @@ class Trainer:
         count = timing_stats['count']
         avg = {key: value / count for key, value in timing_stats.items() if key != 'count'}
         total = avg['step_time'] if avg['step_time'] > 0 else 1e-12
+        effective_epoch = self._effective_epoch(epoch)
         print(
-            f'[Timing][Epoch {epoch}] averaged over {count} steps '
+            f'[Timing][Epoch {effective_epoch}] averaged over {count} steps '
             f'(after {self.profile_warmup_steps} warmup steps): '
             f'data={avg["data_time"] * 1000:.1f}ms ({avg["data_time"] / total * 100:.1f}%), '
             f'h2d={avg["h2d_time"] * 1000:.1f}ms ({avg["h2d_time"] / total * 100:.1f}%), '
@@ -200,6 +203,100 @@ class Trainer:
             grad = param.grad.detach()
             total += grad.float().pow(2).sum().item()
         return math.sqrt(total) if total > 0 else 0.0
+
+    def _tensor_finite_stats(self, tensor):
+        detached = tensor.detach()
+        finite_mask = torch.isfinite(detached)
+        finite_ratio = float(finite_mask.float().mean().item()) if detached.numel() > 0 else 1.0
+        nan_count = int(torch.isnan(detached).sum().item())
+        posinf_count = int(torch.isposinf(detached).sum().item())
+        neginf_count = int(torch.isneginf(detached).sum().item())
+        if finite_mask.any():
+            abs_max = float(detached[finite_mask].abs().max().item())
+        else:
+            abs_max = float('nan')
+        return {
+            'finite_ratio': finite_ratio,
+            'nan_count': nan_count,
+            'posinf_count': posinf_count,
+            'neginf_count': neginf_count,
+            'abs_max': abs_max,
+            'all_finite': nan_count == 0 and posinf_count == 0 and neginf_count == 0,
+        }
+
+    def _scan_named_tensors_for_nonfinite(self, named_tensors):
+        issues = []
+        for name, tensor in named_tensors:
+            if tensor is None:
+                continue
+            stats = self._tensor_finite_stats(tensor)
+            if stats['all_finite']:
+                continue
+            issues.append((name, stats))
+        return issues
+
+    def _format_nonfinite_issues(self, issues, limit=3):
+        if not issues:
+            return 'none'
+        parts = []
+        for name, stats in issues[:limit]:
+            parts.append(
+                f'{name}(nan={stats["nan_count"]}, +inf={stats["posinf_count"]}, '
+                f'-inf={stats["neginf_count"]}, finite_ratio={stats["finite_ratio"]:.6f})'
+            )
+        if len(issues) > limit:
+            parts.append(f'... +{len(issues) - limit} more')
+        return '; '.join(parts)
+
+    def _debug_check_nonfinite_stage(self, stage, batch_idx, loss, lr):
+        if not self.debug_monitor_enabled:
+            return
+        param_issues = self._scan_named_tensors_for_nonfinite(self._model_to_save().named_parameters())
+        grad_issues = self._scan_named_tensors_for_nonfinite(
+            (f'{name}.grad', param.grad) for name, param in self._model_to_save().named_parameters()
+        )
+        if not param_issues and not grad_issues:
+            return
+
+        print(
+            f'[NonFiniteStage][Epoch {self._effective_epoch()} Batch {batch_idx + 1} Step {self.global_train_step}] '
+            f'stage={stage} loss={loss.item():.4f} lr={lr:.8f} '
+            f'params={self._format_nonfinite_issues(param_issues)} '
+            f'grads={self._format_nonfinite_issues(grad_issues)}'
+        )
+        if self.debug_fail_on_nonfinite:
+            raise RuntimeError(
+                f'Non-finite tensors detected at stage={stage} effective_epoch={self._effective_epoch()} batch={batch_idx + 1} step={self.global_train_step}'
+            )
+
+    def _maybe_fail_on_nonfinite(self, batch_idx, loss, lr, cmd_stats, param_stats, param_issues, grad_issues):
+        if not self.debug_monitor_enabled:
+            return
+        has_issue = (
+            not cmd_stats['all_finite'] or
+            not param_stats['all_finite'] or
+            bool(param_issues) or
+            bool(grad_issues)
+        )
+        if not has_issue:
+            return
+
+        print(
+            f'[NonFinite][Epoch {self._effective_epoch()} Batch {batch_idx + 1} Step {self.global_train_step}] '
+            f'loss={loss.item():.4f} lr={lr:.8f} '
+            f'cmd_logits(nan={cmd_stats["nan_count"]}, +inf={cmd_stats["posinf_count"]}, '
+            f'-inf={cmd_stats["neginf_count"]}, finite_ratio={cmd_stats["finite_ratio"]:.6f}, '
+            f'abs_max={cmd_stats["abs_max"]}) '
+            f'param_logits(nan={param_stats["nan_count"]}, +inf={param_stats["posinf_count"]}, '
+            f'-inf={param_stats["neginf_count"]}, finite_ratio={param_stats["finite_ratio"]:.6f}, '
+            f'abs_max={param_stats["abs_max"]}) '
+            f'params={self._format_nonfinite_issues(param_issues)} '
+            f'grads={self._format_nonfinite_issues(grad_issues)}'
+        )
+        if self.debug_fail_on_nonfinite:
+            raise RuntimeError(
+                f'Non-finite tensors detected at effective_epoch={self._effective_epoch()} batch={batch_idx + 1} step={self.global_train_step}'
+            )
 
     def _compute_cmd_distribution(self, cmd_logits, cmd_gt, valid_mask):
         valid_mask = valid_mask.bool()
@@ -230,8 +327,10 @@ class Trainer:
         scaler_scale_next,
         overflow_detected,
         lr,
-        cmd_logits_abs_max,
-        param_pred_abs_max,
+        cmd_stats,
+        param_stats,
+        param_issues,
+        grad_issues,
         pred_hist,
         gt_hist
     ):
@@ -243,7 +342,6 @@ class Trainer:
         step = self.global_train_step
         self.writer.add_scalar('debug/loss_step', loss.item(), step)
         self.writer.add_scalar('debug/cmd_loss_step', loss_dict['cmd_loss'].item(), step)
-        self.writer.add_scalar('debug/eos_loss_step', loss_dict['eos_loss'].item(), step)
         self.writer.add_scalar('debug/param_loss_step', loss_dict['param_loss'].item(), step)
         self.writer.add_scalar('debug/grad_norm', grad_norm, step)
         self.writer.add_scalar('debug/grad_norm_clipped', grad_norm_clipped, step)
@@ -251,8 +349,18 @@ class Trainer:
         self.writer.add_scalar('debug/grad_scaler_scale_next', scaler_scale_next, step)
         self.writer.add_scalar('debug/amp_overflow', float(overflow_detected), step)
         self.writer.add_scalar('debug/lr_step', lr, step)
-        self.writer.add_scalar('debug/cmd_logits_abs_max', cmd_logits_abs_max, step)
-        self.writer.add_scalar('debug/param_pred_abs_max', param_pred_abs_max, step)
+        self.writer.add_scalar('debug/cmd_logits_abs_max', cmd_stats['abs_max'], step)
+        self.writer.add_scalar('debug/param_logits_abs_max', param_stats['abs_max'], step)
+        self.writer.add_scalar('debug/cmd_logits_finite_ratio', cmd_stats['finite_ratio'], step)
+        self.writer.add_scalar('debug/param_logits_finite_ratio', param_stats['finite_ratio'], step)
+        self.writer.add_scalar('debug/cmd_logits_nan_count', cmd_stats['nan_count'], step)
+        self.writer.add_scalar('debug/cmd_logits_posinf_count', cmd_stats['posinf_count'], step)
+        self.writer.add_scalar('debug/cmd_logits_neginf_count', cmd_stats['neginf_count'], step)
+        self.writer.add_scalar('debug/param_logits_nan_count', param_stats['nan_count'], step)
+        self.writer.add_scalar('debug/param_logits_posinf_count', param_stats['posinf_count'], step)
+        self.writer.add_scalar('debug/param_logits_neginf_count', param_stats['neginf_count'], step)
+        self.writer.add_scalar('debug/nonfinite_param_tensor_count', len(param_issues), step)
+        self.writer.add_scalar('debug/nonfinite_grad_tensor_count', len(grad_issues), step)
 
         for idx, value in enumerate(pred_hist):
             self.writer.add_scalar(f'debug/cmd_pred_frac_{idx}', value, step)
@@ -262,12 +370,14 @@ class Trainer:
         pred_top = max(range(len(pred_hist)), key=lambda i: pred_hist[i]) if pred_hist else -1
         gt_top = max(range(len(gt_hist)), key=lambda i: gt_hist[i]) if gt_hist else -1
         print(
-            f'[Debug][Epoch {self.epoch} Batch {batch_idx + 1} Step {step}] '
+            f'[Debug][Epoch {self._effective_epoch()} Batch {batch_idx + 1} Step {step}] '
             f'loss={loss.item():.4f} cmd={loss_dict["cmd_loss"].item():.4f} '
-            f'eos={loss_dict["eos_loss"].item():.4f} param={loss_dict["param_loss"].item():.4f} '
+            f'param={loss_dict["param_loss"].item():.4f} '
             f'grad_norm={grad_norm:.4f} grad_norm_clipped={grad_norm_clipped:.4f} '
             f'scaler={scaler_scale:.4f}->{scaler_scale_next:.4f} overflow={int(overflow_detected)} '
-            f'lr={lr:.8f} cmd|max|={cmd_logits_abs_max:.4f} param|max|={param_pred_abs_max:.4f} '
+            f'lr={lr:.8f} cmd|max|={cmd_stats["abs_max"]:.4f} param|max|={param_stats["abs_max"]:.4f} '
+            f'cmd_finite={cmd_stats["finite_ratio"]:.6f} param_finite={param_stats["finite_ratio"]:.6f} '
+            f'bad_params={len(param_issues)} bad_grads={len(grad_issues)} '
             f'pred_top=cmd{pred_top}:{pred_hist[pred_top]:.3f} '
             f'gt_top=cmd{gt_top}:{gt_hist[gt_top]:.3f}'
         )
@@ -330,7 +440,6 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         cmd_loss_total = 0.0
-        eos_loss_total = 0.0
         param_loss_total = 0.0
         n_batches = len(dataloader)
         if n_batches == 0:
@@ -338,7 +447,7 @@ class Trainer:
 
         max_batches = self.training_cfg.get('max_train_batches')
         effective_batches = min(n_batches, max_batches) if max_batches else n_batches
-        pbar = tqdm(dataloader, desc=f'Epoch {self.epoch}', total=effective_batches)
+        pbar = tqdm(dataloader, desc=f'Epoch {self._effective_epoch()}', total=effective_batches)
 
         processed_batches = 0
         skipped_batches = 0
@@ -360,19 +469,24 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             forward_start_time = time.perf_counter()
             with self._autocast_context():
-                cmd_logits, param_pred = self.model(
+                cmd_logits, param_logits = self.model(
                     images, text_input_ids, text_attention_mask, cad_seq
                 )
 
                 cmd_gt = cad_seq[:, :, 0].long()
-                param_gt = cad_seq[:, :, 1:]
-                progress = self._training_progress(batch_idx, effective_batches)
+                param_gt = cad_seq[:, :, 1:].long()
 
                 loss, loss_dict = self.criterion(
-                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask, progress=progress
+                    cmd_logits, param_logits, cmd_gt, param_gt, cad_valid_mask
                 )
             self._sync_profile_cuda()
             forward_time = time.perf_counter() - forward_start_time
+            self._debug_check_nonfinite_stage(
+                stage='after_forward',
+                batch_idx=batch_idx,
+                loss=loss,
+                lr=float(self.optimizer.param_groups[0]['lr'])
+            )
 
             if not torch.isfinite(loss):
                 skipped_batches += 1
@@ -387,15 +501,39 @@ class Trainer:
             if self.use_grad_scaler:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
+                self._debug_check_nonfinite_stage(
+                    stage='after_backward_unscale',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                self._debug_check_nonfinite_stage(
+                    stage='after_clip',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm_clipped = self._compute_grad_norm()
             else:
                 loss.backward()
+                self._debug_check_nonfinite_stage(
+                    stage='after_backward',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm = self._compute_grad_norm()
                 if grad_clip is not None and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                self._debug_check_nonfinite_stage(
+                    stage='after_clip',
+                    batch_idx=batch_idx,
+                    loss=loss,
+                    lr=float(self.optimizer.param_groups[0]['lr'])
+                )
                 grad_norm_clipped = self._compute_grad_norm()
             self._sync_profile_cuda()
             backward_time = time.perf_counter() - backward_start_time
@@ -410,17 +548,35 @@ class Trainer:
                 self.optimizer.step()
                 scaler_scale_next = 1.0
                 overflow_detected = False
+            self._debug_check_nonfinite_stage(
+                stage='after_optimizer_step',
+                batch_idx=batch_idx,
+                loss=loss,
+                lr=float(self.optimizer.param_groups[0]['lr'])
+            )
             self._sync_profile_cuda()
             optimizer_time = time.perf_counter() - optimizer_start_time
 
             pred_hist, gt_hist = self._compute_cmd_distribution(cmd_logits, cmd_gt, cad_valid_mask)
             lr = float(self.optimizer.param_groups[0]['lr'])
-            cmd_logits_abs_max = float(torch.nan_to_num(cmd_logits.detach(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
-            param_pred_abs_max = float(torch.nan_to_num(param_pred.detach(), nan=0.0, posinf=0.0, neginf=0.0).abs().max().item())
+            cmd_stats = self._tensor_finite_stats(cmd_logits)
+            param_stats = self._tensor_finite_stats(param_logits)
+            param_issues = self._scan_named_tensors_for_nonfinite(self._model_to_save().named_parameters())
+            grad_issues = self._scan_named_tensors_for_nonfinite(
+                (f'{name}.grad', param.grad) for name, param in self._model_to_save().named_parameters()
+            )
+            self._maybe_fail_on_nonfinite(
+                batch_idx,
+                loss,
+                lr,
+                cmd_stats,
+                param_stats,
+                param_issues,
+                grad_issues
+            )
 
             total_loss += loss.item()
             cmd_loss_total += loss_dict['cmd_loss'].item()
-            eos_loss_total += loss_dict['eos_loss'].item()
             param_loss_total += loss_dict['param_loss'].item()
             processed_batches += 1
             iteration_end_time = time.perf_counter()
@@ -446,8 +602,10 @@ class Trainer:
                 scaler_scale_next,
                 overflow_detected,
                 lr,
-                cmd_logits_abs_max,
-                param_pred_abs_max,
+                cmd_stats,
+                param_stats,
+                param_issues,
+                grad_issues,
                 pred_hist,
                 gt_hist
             )
@@ -455,9 +613,7 @@ class Trainer:
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'cmd': f'{loss_dict["cmd_loss"].item():.4f}',
-                'eos': f'{loss_dict["eos_loss"].item():.4f}',
                 'param': f'{loss_dict["param_loss"].item():.4f}',
-                'pw': f'{loss_dict["param_weight"].item():.3f}'
             })
 
             if max_batches and processed_batches >= max_batches:
@@ -471,7 +627,6 @@ class Trainer:
         return {
             'loss': total_loss / processed_batches,
             'cmd_loss': cmd_loss_total / processed_batches,
-            'eos_loss': eos_loss_total / processed_batches,
             'param_loss': param_loss_total / processed_batches,
             'skipped_batches': skipped_batches,
             'lr': self.optimizer.param_groups[0]['lr']
@@ -482,8 +637,11 @@ class Trainer:
         """验证"""
         self.model.eval()
         total_loss = 0.0
-        cmd_acc_total = 0.0
-        param_acc_total = 0.0
+        cmd_token_acc_total = 0.0
+        param_token_acc_total = 0.0
+        token_exact_acc_total = 0.0
+        sequence_cmd_exact_acc_total = 0.0
+        sequence_exact_acc_total = 0.0
         n_batches = len(dataloader)
         if n_batches == 0:
             raise ValueError('Validation dataloader is empty')
@@ -500,61 +658,89 @@ class Trainer:
             cad_valid_mask = batch['cad_valid_mask'].to(self.device, non_blocking=True)
 
             with self._autocast_context():
-                cmd_logits, param_pred = self.model(
+                cmd_logits, param_logits = self.model(
                     images, text_input_ids, text_attention_mask, cad_seq
                 )
 
                 cmd_gt = cad_seq[:, :, 0].long()
-                param_gt = cad_seq[:, :, 1:]
+                param_gt = cad_seq[:, :, 1:].long()
 
                 loss, _ = self.criterion(
-                    cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask, progress=1.0
+                    cmd_logits, param_logits, cmd_gt, param_gt, cad_valid_mask
                 )
             total_loss += loss.item()
             processed_batches += 1
 
             if cad_valid_mask.any():
                 cmd_pred = torch.argmax(cmd_logits, dim=-1)
-                cmd_correct = (cmd_pred == cmd_gt.clamp(min=0))[cad_valid_mask].float().mean()
-                cmd_acc_total += cmd_correct.item()
+                cmd_gt_clamped = cmd_gt.clamp(min=0, max=cmd_logits.shape[-1] - 1)
+                cmd_token_acc_total += (cmd_pred == cmd_gt_clamped)[cad_valid_mask].float().mean().item()
 
-                param_error = torch.abs(param_pred - param_gt)
-                cmd_mask = self.criterion.cmd_param_mask.to(param_error.device)[cmd_gt.clamp(min=0, max=self.criterion.cmd_param_mask.shape[0] - 1)]
+                param_pred = torch.argmax(param_logits, dim=-1)
+                cmd_mask = self.criterion.cmd_param_mask.to(param_pred.device)[
+                    cmd_gt_clamped.clamp(min=0, max=self.criterion.cmd_param_mask.shape[0] - 1)
+                ]
                 combined_mask = cad_valid_mask.unsqueeze(-1) & cmd_mask
                 if combined_mask.any():
-                    param_correct = (param_error < 0.1)[combined_mask].float().mean()
-                    param_acc_total += param_correct.item()
+                    param_token_acc_total += (param_pred == param_gt)[combined_mask].float().mean().item()
+
+                token_cmd_correct = (cmd_pred == cmd_gt_clamped) & cad_valid_mask
+                active_param_counts = combined_mask.sum(dim=-1)
+                token_param_correct = torch.ones_like(token_cmd_correct, dtype=torch.bool)
+                if combined_mask.any():
+                    token_param_correct = (~combined_mask | (param_pred == param_gt)).all(dim=-1)
+                token_exact = token_cmd_correct & token_param_correct & (active_param_counts > 0)
+                token_exact = token_exact | (token_cmd_correct & (active_param_counts == 0))
+                token_exact_acc_total += token_exact[cad_valid_mask].float().mean().item()
+
+                seq_cmd_exact = token_cmd_correct.all(dim=-1)
+                seq_exact = (token_exact | ~cad_valid_mask).all(dim=-1)
+                sequence_cmd_exact_acc_total += seq_cmd_exact.float().mean().item()
+                sequence_exact_acc_total += seq_exact.float().mean().item()
 
             if max_batches and processed_batches >= max_batches:
                 break
 
         return {
             'loss': total_loss / processed_batches,
-            'cmd_acc': cmd_acc_total / processed_batches,
-            'param_acc': param_acc_total / processed_batches
+            'cmd_token_acc': cmd_token_acc_total / processed_batches,
+            'param_token_acc': param_token_acc_total / processed_batches,
+            'token_exact_acc': token_exact_acc_total / processed_batches,
+            'sequence_cmd_exact_acc': sequence_cmd_exact_acc_total / processed_batches,
+            'sequence_exact_acc': sequence_exact_acc_total / processed_batches,
         }
 
     def train(self, train_loader, val_loader, num_epochs):
         """完整训练循环"""
-        for epoch in range(self.epoch, num_epochs):
+        local_num_epochs = max(num_epochs - self.epoch_offset, 0)
+        if self.epoch >= local_num_epochs:
+            print(
+                f'Current local epoch {self.epoch} already reached configured training limit '
+                f'(num_epochs={num_epochs}, epoch_offset={self.epoch_offset}). Nothing to do.'
+            )
+            self.writer.close()
+            return
+
+        for epoch in range(self.epoch, local_num_epochs):
             self.epoch = epoch
+            effective_epoch = self._effective_epoch(epoch)
             self._apply_lr_factor(epoch)
-            self.scheduler.last_epoch = epoch
+            self.scheduler.last_epoch = effective_epoch
             start_time = time.time()
 
             train_metrics = self.train_one_epoch(train_loader)
             val_metrics = self.evaluate(val_loader)
-            self._log_metrics(train_metrics, val_metrics, epoch)
+            self._log_metrics(train_metrics, val_metrics, effective_epoch)
 
             if val_metrics['loss'] < self.best_val_loss:
                 self.best_val_loss = val_metrics['loss']
                 self.save_checkpoint('best.pth')
 
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f'epoch_{epoch + 1}.pth')
+            if (effective_epoch + 1) % 10 == 0:
+                self.save_checkpoint(f'epoch_{effective_epoch + 1}.pth')
 
             elapsed = time.time() - start_time
-            print(f'Epoch {epoch}: train_loss={train_metrics["loss"]:.4f}, '
+            print(f'Epoch {effective_epoch}: train_loss={train_metrics["loss"]:.4f}, '
                   f'val_loss={val_metrics["loss"]:.4f}, time={elapsed:.1f}s')
 
         self.writer.close()
@@ -572,6 +758,7 @@ class Trainer:
         checkpoint_path = os.path.join(self.log_dir, 'checkpoints', filename)
         torch.save({
             'epoch': self.epoch,
+            'effective_epoch': self._effective_epoch(),
             'model_state_dict': self._model_to_save().state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -613,14 +800,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, grad_clip=1
         cad_valid_mask = batch['cad_valid_mask'].to(device)
 
         optimizer.zero_grad()
-        cmd_logits, param_pred = model(
+        cmd_logits, param_logits = model(
             images, text_input_ids, text_attention_mask, cad_seq
         )
 
         cmd_gt = cad_seq[:, :, 0].long()
-        param_gt = cad_seq[:, :, 1:]
+        param_gt = cad_seq[:, :, 1:].long()
 
-        loss, _ = criterion(cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask)
+        loss, _ = criterion(cmd_logits, param_logits, cmd_gt, param_gt, cad_valid_mask)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -647,14 +834,14 @@ def evaluate(model, dataloader, criterion, device):
         cad_seq = batch['cad_seq'].to(device)
         cad_valid_mask = batch['cad_valid_mask'].to(device)
 
-        cmd_logits, param_pred = model(
+        cmd_logits, param_logits = model(
             images, text_input_ids, text_attention_mask, cad_seq
         )
 
         cmd_gt = cad_seq[:, :, 0].long()
-        param_gt = cad_seq[:, :, 1:]
+        param_gt = cad_seq[:, :, 1:].long()
 
-        loss, _ = criterion(cmd_logits, param_pred, cmd_gt, param_gt, cad_valid_mask)
+        loss, _ = criterion(cmd_logits, param_logits, cmd_gt, param_gt, cad_valid_mask)
         total_loss += loss.item()
 
     return total_loss / n_batches

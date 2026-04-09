@@ -26,8 +26,8 @@ from .train import (
 )
 from .eval import (
     Evaluator,
-    evaluate_sequence_accuracy,
-    evaluate_parameter_accuracy
+    compute_exact_match_metrics,
+    CADMetrics
 )
 
 __version__ = '1.0.0'
@@ -48,6 +48,6 @@ __all__ = [
     'Trainer',
     # Eval
     'Evaluator',
-    'evaluate_sequence_accuracy',
-    'evaluate_parameter_accuracy',
+    'compute_exact_match_metrics',
+    'CADMetrics',
 ]

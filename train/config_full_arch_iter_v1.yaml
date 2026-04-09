@@ -16,29 +16,26 @@ model:
   decoder_condition_scale: 1.0
 
 training:
-  batch_size: 384
+  batch_size: 512
   num_epochs: 300
+  epoch_offset: 40
   lr: 1.0e-05
   weight_decay: 0.01
   warmup_epochs: 5
   gradient_clip: 0.5
   num_workers: 24
   precision: bf16
-  debug_monitor_enabled: true
+  debug_monitor_enabled: false
   debug_log_every_batches: 10
+  debug_fail_on_nonfinite: false
 
 loss:
-  cmd_weight: 1.0
-  eos_weight: 0.6
-  param_weight: 0.35
+  cmd_weight: 0.5
+  param_weight: 0.5
   use_cmd_mask: true
-  eos_token_id: 3
   label_smoothing: 0.05
   class_weights: [1.0, 1.1, 1.0, 1.6, 1.3, 1.15]
-  param_scale: 1.0
-  param_curriculum_start: 0.15
-  param_curriculum_end: 0.65
-  param_loss_cap: 1.0
+  n_param_bins: 256
 
 optimizer:
   type: AdamW
@@ -59,7 +56,7 @@ data:
   backend: lmdb
   lmdb_path: cad_data.lmdb
   pin_memory: true
-  persistent_workers: false
+  persistent_workers: true
   prefetch_factor: 1
   max_prefetch_gb: 48.0
 

@@ -3,6 +3,9 @@
 基于设计文档 3.6 节
 """
 
+from contextlib import nullcontext
+
+import torch
 import torch.nn as nn
 
 from .cad_decoder import CADDecoder
@@ -37,6 +40,7 @@ class DualModalCADGenerator(nn.Module):
         decoder_condition_injection = self.config.get('decoder_condition_injection', 'film_residual')
         decoder_condition_hidden_dim = self.config.get('decoder_condition_hidden_dim', embed_dim)
         decoder_condition_scale = self.config.get('decoder_condition_scale', 1.0)
+        n_param_bins = self.config.get('n_param_bins', 256)
 
         self.view_encoder = ViewEncoder(
             embed_dim=embed_dim,
@@ -59,6 +63,7 @@ class DualModalCADGenerator(nn.Module):
             condition_injection=decoder_condition_injection,
             condition_hidden_dim=decoder_condition_hidden_dim,
             condition_scale=decoder_condition_scale,
+            n_param_bins=n_param_bins,
         )
         self.visual_memory_mode = visual_memory_mode
         self.use_global_fused_condition = use_global_fused_condition
@@ -79,26 +84,18 @@ class DualModalCADGenerator(nn.Module):
             'decoder_condition_injection': 'film_residual',
             'decoder_condition_hidden_dim': 512,
             'decoder_condition_scale': 1.0,
+            'n_param_bins': 256,
         }
 
     def forward(self, images, text_input_ids, text_attention_mask, tgt_cad_seq=None):
         """前向传播"""
         visual_memory, global_condition = self._encode_modalities(images, text_input_ids, text_attention_mask)
-        return self.cad_decoder(
-            visual_memory,
-            global_condition,
-            tgt_cad_seq,
-            training=self.training
-        )
+        return self._decode_in_full_precision(visual_memory, global_condition, tgt_cad_seq)
 
     def generate(self, images, text_input_ids, text_attention_mask, max_steps=120):
         """推理模式 - 生成 CAD 序列"""
         visual_memory, global_condition = self._encode_modalities(images, text_input_ids, text_attention_mask)
-        return self.cad_decoder.generate(
-            visual_memory,
-            global_condition,
-            max_steps=max_steps
-        )
+        return self._generate_in_full_precision(visual_memory, global_condition, max_steps=max_steps)
 
     def encode_images(self, images):
         """仅图像编码，返回全局图像特征。"""
@@ -130,3 +127,30 @@ class DualModalCADGenerator(nn.Module):
 
         global_condition = z_fused if self.use_global_fused_condition else None
         return visual_memory, global_condition
+
+    def _full_precision_decoder_context(self, device_type):
+        if device_type != 'cuda':
+            return nullcontext()
+        return torch.autocast(device_type=device_type, enabled=False)
+
+    def _decode_in_full_precision(self, visual_memory, global_condition=None, tgt_cad_seq=None):
+        with self._full_precision_decoder_context(visual_memory.device.type):
+            visual_memory_fp32 = visual_memory.float()
+            global_condition_fp32 = global_condition.float() if global_condition is not None else None
+            tgt_seq_fp32 = tgt_cad_seq.float() if tgt_cad_seq is not None else None
+            return self.cad_decoder(
+                visual_memory_fp32,
+                global_condition_fp32,
+                tgt_seq_fp32,
+                training=self.training
+            )
+
+    def _generate_in_full_precision(self, visual_memory, global_condition=None, max_steps=120):
+        with self._full_precision_decoder_context(visual_memory.device.type):
+            visual_memory_fp32 = visual_memory.float()
+            global_condition_fp32 = global_condition.float() if global_condition is not None else None
+            return self.cad_decoder.generate(
+                visual_memory_fp32,
+                global_condition_fp32,
+                max_steps=max_steps
+            )

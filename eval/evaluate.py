@@ -5,7 +5,7 @@
 import torch
 from tqdm import tqdm
 
-from eval.metrics import CADMetrics, CMD_PARAM_MASK
+from eval.metrics import CADMetrics
 
 
 class Evaluator:
@@ -21,10 +21,7 @@ class Evaluator:
         """在数据集上评估模型"""
         self.model.eval()
 
-        total_cmd_correct = 0.0
-        total_cmd_count = 0
-        total_param_correct = 0.0
-        total_param_count = 0
+        total_metrics = self.metrics_calculator.empty_metrics()
         total_batches = len(dataloader)
         effective_batches = min(total_batches, max_batches) if max_batches else total_batches
         processed_batches = 0
@@ -46,35 +43,27 @@ class Evaluator:
             cmd_pred, param_pred = self._pad_generated_outputs(cmd_pred, param_pred, seq_len)
 
             gt_cmds = cad_seq[:, :, 0].long().clamp(min=0)
-            gt_params = cad_seq[:, :, 1:]
+            gt_params = cad_seq[:, :, 1:].long()
             valid_mask = cad_valid_mask.bool()
 
-            if valid_mask.any():
-                cmd_matches = (cmd_pred == gt_cmds)[valid_mask].float()
-                total_cmd_correct += cmd_matches.sum().item()
-                total_cmd_count += cmd_matches.numel()
-
-                cmd_mask = CMD_PARAM_MASK.to(self.device)[gt_cmds]
-                combined_mask = valid_mask.unsqueeze(-1) & cmd_mask
-                if combined_mask.any():
-                    param_matches = (torch.abs(param_pred - gt_params) < self.metrics_calculator.param_threshold)[combined_mask].float()
-                    total_param_correct += param_matches.sum().item()
-                    total_param_count += param_matches.numel()
+            batch_metrics = self.metrics_calculator.compute_all_metrics(
+                cmd_pred,
+                param_pred.long(),
+                gt_cmds,
+                gt_params,
+                valid_mask,
+            )
+            for name, value in batch_metrics.items():
+                total_metrics[name] += value
 
             processed_batches += 1
             if max_batches and processed_batches >= max_batches:
                 break
 
-        if total_cmd_count == 0:
+        if processed_batches == 0:
             return self.metrics_calculator.empty_metrics()
 
-        cmd_accuracy = total_cmd_correct / total_cmd_count
-        param_accuracy = (total_param_correct / total_param_count) if total_param_count > 0 else 0.0
-        return {
-            'cmd_accuracy': cmd_accuracy,
-            'param_accuracy': param_accuracy,
-            'combined_score': 0.5 * cmd_accuracy + 0.5 * param_accuracy,
-        }
+        return {name: value / processed_batches for name, value in total_metrics.items()}
 
     @torch.no_grad()
     def generate_and_save(self, dataloader, save_path=None, max_batches=None):

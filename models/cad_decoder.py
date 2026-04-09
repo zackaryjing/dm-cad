@@ -132,7 +132,8 @@ class CADDecoder(nn.Module):
 
     def __init__(self, embed_dim=512, n_layers=6, n_heads=8, max_seq_len=120,
                  start_token=4, condition_injection='film_residual',
-                 condition_hidden_dim=512, condition_scale=1.0):
+                 condition_hidden_dim=512, condition_scale=1.0,
+                 n_param_bins=256):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.embed_dim = embed_dim
@@ -142,6 +143,7 @@ class CADDecoder(nn.Module):
         self.cmd_embed = nn.Embedding(num_embeddings=self.n_cmd_types, embedding_dim=embed_dim)
 
         self.n_params = 19
+        self.n_param_bins = n_param_bins
         self.param_embed = nn.Linear(self.n_params, embed_dim)
 
         self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len + 1, embed_dim))
@@ -159,7 +161,7 @@ class CADDecoder(nn.Module):
         self.param_head = nn.Sequential(
             nn.Linear(embed_dim, 512),
             nn.ReLU(),
-            nn.Linear(512, self.n_params)
+            nn.Linear(512, self.n_params * self.n_param_bins)
         )
 
     def forward(self, visual_memory, global_condition=None, tgt_seq=None, training=True):
@@ -170,7 +172,7 @@ class CADDecoder(nn.Module):
             tgt_seq: [batch, seq_len, 20] - 目标 CAD 序列
         Returns:
             cmd_logits: [batch, seq_len, 6] - 命令类型预测
-            param_pred: [batch, seq_len, 19] - 参数预测
+            param_logits: [batch, seq_len, 19, 256] - 参数分类 logits
         """
         batch_size = visual_memory.shape[0]
 
@@ -192,8 +194,8 @@ class CADDecoder(nn.Module):
         )
 
         cmd_logits = self.cmd_head(output)
-        param_pred = self.param_head(output)
-        return cmd_logits, param_pred
+        param_logits = self.param_head(output).view(batch_size, seq_len, self.n_params, self.n_param_bins)
+        return cmd_logits, param_logits
 
     def _embed_sequence(self, seq):
         """嵌入 CAD 序列"""
@@ -215,7 +217,7 @@ class CADDecoder(nn.Module):
 
     def _build_causal_mask(self, seq_len, device):
         return torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=device),
+            torch.ones((seq_len, seq_len), device=device, dtype=torch.bool),
             diagonal=1
         )
 
@@ -224,7 +226,7 @@ class CADDecoder(nn.Module):
 
         Returns:
             cmd_tensor: [batch, steps] - 生成的命令类型
-            param_tensor: [batch, steps, 19] - 生成的参数
+            param_tensor: [batch, steps, 19] - 生成的离散参数值
         """
         batch_size = visual_memory.shape[0]
         device = visual_memory.device
@@ -249,8 +251,9 @@ class CADDecoder(nn.Module):
             last_hidden = output[:, -1:, :]
 
             cmd_logits = self.cmd_head(last_hidden)
-            param_pred = self.param_head(last_hidden)
+            param_logits = self.param_head(last_hidden).view(batch_size, 1, self.n_params, self.n_param_bins)
             cmd_pred = torch.argmax(cmd_logits, dim=-1)
+            param_pred = torch.argmax(param_logits, dim=-1)
 
             if generated_cmds:
                 prev_cmd = generated_cmds[-1]
@@ -262,7 +265,7 @@ class CADDecoder(nn.Module):
             generated_params.append(param_pred)
 
             ended = ended | (cmd_pred.squeeze(-1) == 3)
-            next_token = torch.cat([cmd_pred.float().unsqueeze(-1), param_pred], dim=-1)
+            next_token = torch.cat([cmd_pred.float().unsqueeze(-1), param_pred.float()], dim=-1)
             decoder_seq = torch.cat([decoder_seq, next_token], dim=1)
 
             if ended.all():
@@ -273,6 +276,6 @@ class CADDecoder(nn.Module):
             param_tensor = torch.cat(generated_params, dim=1)
         else:
             cmd_tensor = torch.empty(batch_size, 0, dtype=torch.long, device=device)
-            param_tensor = torch.empty(batch_size, 0, self.n_params, device=device)
+            param_tensor = torch.empty(batch_size, 0, self.n_params, dtype=torch.long, device=device)
 
         return cmd_tensor, param_tensor
