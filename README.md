@@ -50,10 +50,13 @@ conda activate /home/jing/allprojects/pythonenvironment/dmcad
 ## 训练
 
 ```bash
-# 使用默认配置训练 (会自动创建独立的 run 目录)
+# 单卡训练
 python train_main.py --config train/config.yaml
 
-# 从检查点恢复训练 (继续写入该 checkpoint 所在的 run 目录)
+# 多卡训练（推荐，自动启用 DDP）
+torchrun --nproc_per_node=2 train_main.py --config train/config_full_arch_iter_v1.yaml
+
+# 从检查点恢复训练（继续写入该 checkpoint 所在的 run 目录）
 python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/checkpoints/epoch_10.pth
 
 # 从旧 checkpoint 初始化参数，但创建新的 run 目录继续实验
@@ -65,13 +68,24 @@ python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/c
 - `data.data_root`: 数据集根目录 (默认：`datasets/dataset_v1`)
 - `data.train_ids_file`: 训练集 ids 文件 (**相对于 data_root**)
 - `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
-- `training.progress_total_epochs`: 可选；仅用于计算 loss curriculum 的训练进度分母。默认等于 `training.num_epochs`
+- `training.epoch_offset`: 可选；用于从中间 epoch 对齐学习率调度和 checkpoint 编号
+- `training.precision`: `fp32` / `fp16` / `bf16`
 - `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
 - `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
 - `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`
 - `data.persistent_workers`: 是否在 epoch 间保留 worker 进程，默认 `false`
 - `data.prefetch_factor`: 每个 worker 预取的 batch 数，默认 `1`
 - `data.max_prefetch_gb`: DataLoader 允许的预取图像内存预算上限（GiB）；会据此自动下调有效 `num_workers`
+- `loss.cmd_weight` / `loss.param_weight`: 命令 CE 和参数 CE 的权重
+- `loss.n_param_bins`: 参数离散分类桶数；当前参数严格使用 `0..255`，因此默认 `256`
+
+### 分布式训练说明
+
+- 多卡训练通过 `torchrun` 自动进入 DDP，不再依赖 `DataParallel`
+- 运行时会自动读取 `LOCAL_RANK/RANK/WORLD_SIZE`
+- 只有 rank 0 会打印主日志、写 TensorBoard、保存 checkpoint
+- 训练和验证指标都会做跨进程聚合，看到的是全局值
+- `device.visible_devices` 仍用于设置 `CUDA_VISIBLE_DEVICES`
 
 ## 评估
 
@@ -195,7 +209,7 @@ LMDB 中每个 sample 使用 `group_id/sample_name` 作为 key，value 包含：
 | MultiViewFusion | `[B, 8, 512]` | `[B, 512]` |
 | TextEncoder | `[B, seq_len]` | `[B, 512]` |
 | ModalFusion | `[B, 512], [B, 512]` | `[B, 512]` |
-| CADDecoder | `[B, 512], [B, T, 20]` | `[B, T, 6]`, `[B, T, 19]` |
+| CADDecoder | `[B, 512], [B, T, 20]` | `[B, T, 6]`, `[B, T, 19, 256]` |
 
 ### 损失函数
 
@@ -203,17 +217,25 @@ LMDB 中每个 sample 使用 `group_id/sample_name` 作为 key，value 包含：
 L_total = cmd_weight * L_cmd + param_weight * L_param
 
 L_cmd = CrossEntropy(cmd_logits, cmd_gt)  # 6 类
-L_param = SmoothL1(param_pred, param_gt)  # 19 维，仅有效位置计算
+L_param = CrossEntropy(param_logits, param_gt)  # 19 个参数位，各自做 256 类分类，仅在命令有效位置计算
 ```
+
+当前设计原则：
+
+- `cmd` 和 `param` 都视为离散分类任务
+- `EOS` 仅作为普通命令类别处理，不再单独引入 `eos_loss`
+- 不再使用 `param_scale`、`tanh`、`param curriculum`
+- 参数监督默认按 `0..255` 的精确离散值学习
 
 ## 评估指标
 
 | 指标 | 说明 |
 |------|------|
-| Command Accuracy | 命令类型预测准确率 (6 类) |
-| Parameter Accuracy | 参数预测准确率 (相对误差<0.1) |
-| Chamfer Distance | 几何形状相似度 (点云) |
-| Invalidity Ratio | 生成无效序列比例 |
+| `cmd_token_acc` | 有效 token 上命令类别的准确率 |
+| `param_token_acc` | 有效参数位上的精确匹配率 |
+| `token_exact_acc` | 一个 token 上命令和该 token 所有有效参数都预测正确的比例 |
+| `sequence_cmd_exact_acc` | 整条序列命令全对的比例 |
+| `sequence_exact_acc` | 整条序列命令和所有有效参数都全对的比例 |
 
 ## 常见问题
 
@@ -228,29 +250,10 @@ L_param = SmoothL1(param_pred, param_gt)  # 19 维，仅有效位置计算
 - `max_prefetch_gb`: 预取图像张量的估算内存预算上限；DataLoader 会按 `batch_size × 8 × 3 × H × W × 4 bytes` 估算单 batch 图像内存，并自动限制有效 `num_workers`
 - 对于大 batch 训练，建议保持 `prefetch_factor=1`，再根据机器内存逐步增加 `max_prefetch_gb`
 
-### Loss Curriculum 进度
-- `training.progress_total_epochs` 只影响 loss 中的 curriculum progress 计算。
-- 当前它只用于参数损失权重随训练进度逐步增强这一逻辑。
-- 若不设置，默认使用 `training.num_epochs`，行为与普通训练一致。
-- 这个字段的主要用途是做短程调试或从中间 checkpoint 恢复时，仍然复现原始长训练的 loss curriculum 节奏。
-
-例如：
-
-```yaml
-training:
-  num_epochs: 20
-  progress_total_epochs: 200
-```
-
-含义是：
-- 实际只训练到第 20 个 epoch
-- 但 loss curriculum 会按“总训练长度 200 个 epoch”来计算当前 progress
-
-注意：
-- `progress_total_epochs` **不会**改变学习率调度器的总 epoch
-- `progress_total_epochs` **不会**改变 checkpoint 保存频率
-- `progress_total_epochs` **不会**改变训练循环实际跑多少个 epoch
-- 它当前只影响 loss curriculum，不影响 optimizer / scheduler 的其它行为
+### Epoch Offset
+- `training.epoch_offset` 用于从中间 checkpoint 开新 run 时，对齐学习率调度、TensorBoard 横轴和 checkpoint 编号
+- 它不会改变模型参数本身，只改变“这次 run 对应全局第几个 epoch”的解释
+- 若不需要从中间 epoch 对齐，保持 `0` 即可
 
 ### 命令类型不匹配
 - 模型使用 **6 种命令类型** (DeepCAD 原始格式)
@@ -258,6 +261,7 @@ training:
 
 ### 维度不匹配
 - CAD 序列：20 维 = 1 命令类型 + 19 参数
+- 当前参数头输出不是 `[B, T, 19]` 回归值，而是 `[B, T, 19, 256]` 分类 logits
 - 参数预测输出：**19 维** (不是 20 维)
 - `cad_valid_mask` 过滤无效位置 (cmd_type < 0)
 
