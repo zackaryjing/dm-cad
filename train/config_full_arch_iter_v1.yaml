@@ -16,9 +16,9 @@ model:
   decoder_condition_scale: 1.0
 
 training:
-  batch_size: 512
+  batch_size: 320
   num_epochs: 300
-  epoch_offset: 40
+  epoch_offset: 0
   lr: 1.0e-05
   weight_decay: 0.01
   warmup_epochs: 5
@@ -56,7 +56,7 @@ data:
   backend: lmdb
   lmdb_path: cad_data.lmdb
   pin_memory: true
-  persistent_workers: true
+  persistent_workers: false
   prefetch_factor: 1
   max_prefetch_gb: 48.0
 
@@ -67,6 +67,6 @@ log:
 
 device:
   type: cuda
-  visible_devices: [3,4]
+  visible_devices: [2,3]
   use_data_parallel: true
   output_device: 0

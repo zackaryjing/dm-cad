@@ -9,14 +9,16 @@ import math
 from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from models.dual_modal_cad import DualModalCADGenerator
-from runtime_device import get_configured_visible_device_count
+from runtime_device import get_configured_visible_device_count, get_distributed_env
 from train.loss import CADLoss
 
 
@@ -30,6 +32,12 @@ class Trainer:
         self.training_cfg = config.get('training', {})
         self.epoch_offset = max(int(self.training_cfg.get('epoch_offset', 0)), 0)
         self.configured_visible_device_count = get_configured_visible_device_count(config)
+        self.dist_env = get_distributed_env()
+        self.is_distributed = bool(self.dist_env.get('enabled', False))
+        self.rank = int(self.dist_env.get('rank', 0))
+        self.world_size = int(self.dist_env.get('world_size', 1))
+        self.local_rank = int(self.dist_env.get('local_rank', 0))
+        self.is_main_process = bool(self.dist_env.get('is_main_process', True))
         self.device = self._resolve_runtime_device(device)
         self.precision = self._resolve_precision_mode()
         self.autocast_enabled, self.autocast_dtype, self.use_grad_scaler = self._configure_precision()
@@ -42,15 +50,15 @@ class Trainer:
         self.debug_fail_on_nonfinite = bool(self.training_cfg.get('debug_fail_on_nonfinite', False))
         self.global_train_step = 0
 
-        print(
+        self._rank_print(
             f'Precision mode: {self.precision} '
             f'(autocast={"enabled" if self.autocast_enabled else "disabled"}, '
             f'grad_scaler={"enabled" if self.use_grad_scaler else "disabled"})'
         )
 
         base_model = DualModalCADGenerator(config.get('model', {}))
+        base_model.to(self.device)
         self.model = self._wrap_model_for_parallel(base_model)
-        self.model.to(self.device)
 
         loss_cfg = config.get('loss', {})
         self.criterion = CADLoss(
@@ -80,7 +88,7 @@ class Trainer:
 
         log_cfg = config.get('log', {})
         self.log_dir = log_cfg.get('log_dir', config.get('log_dir', 'runs/dmcad'))
-        self.writer = SummaryWriter(self.log_dir)
+        self.writer = SummaryWriter(self.log_dir) if self.is_main_process else None
 
     def _resolve_precision_mode(self):
         if 'precision' in self.training_cfg:
@@ -109,6 +117,10 @@ class Trainer:
         if not self.autocast_enabled:
             return nullcontext()
         return torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype)
+
+    def _rank_print(self, *args, force=False, **kwargs):
+        if force or self.is_main_process:
+            print(*args, **kwargs)
 
     def _build_lr_lambda(self, scheduler_cfg):
         warmup_epochs = max(int(self.training_cfg.get('warmup_epochs', 0)), 0)
@@ -146,8 +158,7 @@ class Trainer:
     def _sync_profile_cuda(self):
         if self.device.type != 'cuda':
             return
-        for device_idx in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(device_idx)
+        torch.cuda.synchronize(self.device)
 
     def _init_timing_stats(self):
         return {
@@ -184,7 +195,7 @@ class Trainer:
         avg = {key: value / count for key, value in timing_stats.items() if key != 'count'}
         total = avg['step_time'] if avg['step_time'] > 0 else 1e-12
         effective_epoch = self._effective_epoch(epoch)
-        print(
+        self._rank_print(
             f'[Timing][Epoch {effective_epoch}] averaged over {count} steps '
             f'(after {self.profile_warmup_steps} warmup steps): '
             f'data={avg["data_time"] * 1000:.1f}ms ({avg["data_time"] / total * 100:.1f}%), '
@@ -334,7 +345,7 @@ class Trainer:
         pred_hist,
         gt_hist
     ):
-        if not self.debug_monitor_enabled:
+        if not self.debug_monitor_enabled or self.writer is None:
             return
         if (batch_idx + 1) % self.debug_log_every_batches != 0:
             return
@@ -386,13 +397,16 @@ class Trainer:
         if requested_device != 'cuda' or not torch.cuda.is_available():
             return torch.device(requested_device)
 
+        if self.is_distributed:
+            return torch.device(f'cuda:{self.local_rank}')
+
         visible_gpu_count = torch.cuda.device_count()
         if visible_gpu_count == 0:
             return torch.device('cpu')
 
         output_device = int(self.device_cfg.get('output_device', 0))
         if output_device < 0 or output_device >= visible_gpu_count:
-            print(
+            self._rank_print(
                 f'Configured output_device={output_device} exceeds visible CUDA range [0, {visible_gpu_count - 1}]; '
                 'falling back to cuda:0.'
             )
@@ -404,26 +418,33 @@ class Trainer:
         if self.requested_device != 'cuda' or not torch.cuda.is_available():
             return model
 
+        if self.is_distributed:
+            self._rank_print(
+                f'Enabling DistributedDataParallel on rank={self.rank}, local_rank={self.local_rank}, '
+                f'device={self.device}'
+            )
+            return DDP(model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=False)
+
         visible_gpu_count = torch.cuda.device_count()
         use_data_parallel = bool(self.device_cfg.get('use_data_parallel', False))
         if not use_data_parallel:
             return model
 
         if self.configured_visible_device_count is not None and self.configured_visible_device_count <= 1:
-            print('Single visible device configured; disabling DataParallel and using one GPU.')
+            self._rank_print('Single visible device configured; disabling DataParallel and using one GPU.')
             return model
 
         if visible_gpu_count <= 1:
-            print('DataParallel requested but fewer than 2 CUDA devices are visible; using single GPU.')
+            self._rank_print('DataParallel requested but fewer than 2 CUDA devices are visible; using single GPU.')
             return model
 
         output_device = self.device.index if self.device.index is not None else 0
         device_ids = list(range(visible_gpu_count))
-        print(f'Enabling DataParallel on visible CUDA devices: {device_ids}, output_device={output_device}')
+        self._rank_print(f'Enabling DataParallel on visible CUDA devices: {device_ids}, output_device={output_device}')
         return nn.DataParallel(model, device_ids=device_ids, output_device=output_device)
 
     def _model_to_save(self):
-        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        return self.model.module if isinstance(self.model, (nn.DataParallel, DDP)) else self.model
 
     def _load_state_dict_flexible(self, model, state_dict):
         try:
@@ -434,6 +455,24 @@ class Trainer:
                 for key, value in state_dict.items()
             }
             model.load_state_dict(stripped)
+
+    def _maybe_set_sampler_epoch(self, dataloader, epoch):
+        sampler = getattr(dataloader, 'sampler_for_epoch', None)
+        if sampler is not None and hasattr(sampler, 'set_epoch'):
+            sampler.set_epoch(epoch)
+
+    def _all_reduce_tensor(self, tensor):
+        if self.is_distributed:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor
+
+    def _finalize_epoch_stats(self, stats):
+        device = self.device
+        keys = sorted(stats.keys())
+        tensor = torch.tensor([float(stats[key]) for key in keys], device=device, dtype=torch.float64)
+        tensor = self._all_reduce_tensor(tensor)
+        reduced = {key: float(value) for key, value in zip(keys, tensor.tolist())}
+        return reduced
 
     def train_one_epoch(self, dataloader):
         """训练一个 epoch"""
@@ -447,7 +486,12 @@ class Trainer:
 
         max_batches = self.training_cfg.get('max_train_batches')
         effective_batches = min(n_batches, max_batches) if max_batches else n_batches
-        pbar = tqdm(dataloader, desc=f'Epoch {self._effective_epoch()}', total=effective_batches)
+        pbar = tqdm(
+            dataloader,
+            desc=f'Epoch {self._effective_epoch()}',
+            total=effective_batches,
+            disable=not self.is_main_process,
+        )
 
         processed_batches = 0
         skipped_batches = 0
@@ -491,7 +535,8 @@ class Trainer:
             if not torch.isfinite(loss):
                 skipped_batches += 1
                 self.optimizer.zero_grad(set_to_none=True)
-                pbar.set_postfix({'loss': 'non-finite', 'skipped': skipped_batches})
+                if self.is_main_process:
+                    pbar.set_postfix({'loss': 'non-finite', 'skipped': skipped_batches})
                 iteration_end_time = time.perf_counter()
                 continue
 
@@ -610,11 +655,12 @@ class Trainer:
                 gt_hist
             )
 
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'cmd': f'{loss_dict["cmd_loss"].item():.4f}',
-                'param': f'{loss_dict["param_loss"].item():.4f}',
-            })
+            if self.is_main_process:
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'cmd': f'{loss_dict["cmd_loss"].item():.4f}',
+                    'param': f'{loss_dict["param_loss"].item():.4f}',
+                })
 
             if max_batches and processed_batches >= max_batches:
                 break
@@ -624,11 +670,19 @@ class Trainer:
 
         self._print_timing_summary(timing_stats, self.epoch)
 
-        return {
-            'loss': total_loss / processed_batches,
-            'cmd_loss': cmd_loss_total / processed_batches,
-            'param_loss': param_loss_total / processed_batches,
+        reduced = self._finalize_epoch_stats({
+            'loss_sum': total_loss,
+            'cmd_loss_sum': cmd_loss_total,
+            'param_loss_sum': param_loss_total,
+            'processed_batches': processed_batches,
             'skipped_batches': skipped_batches,
+        })
+        denom = max(reduced['processed_batches'], 1.0)
+        return {
+            'loss': reduced['loss_sum'] / denom,
+            'cmd_loss': reduced['cmd_loss_sum'] / denom,
+            'param_loss': reduced['param_loss_sum'] / denom,
+            'skipped_batches': reduced['skipped_batches'],
             'lr': self.optimizer.param_groups[0]['lr']
         }
 
@@ -637,11 +691,15 @@ class Trainer:
         """验证"""
         self.model.eval()
         total_loss = 0.0
-        cmd_token_acc_total = 0.0
-        param_token_acc_total = 0.0
-        token_exact_acc_total = 0.0
-        sequence_cmd_exact_acc_total = 0.0
-        sequence_exact_acc_total = 0.0
+        cmd_token_correct = 0.0
+        cmd_token_count = 0.0
+        param_token_correct = 0.0
+        param_token_count = 0.0
+        token_exact_correct = 0.0
+        token_exact_count = 0.0
+        sequence_cmd_exact_correct = 0.0
+        sequence_exact_correct = 0.0
+        sequence_count = 0.0
         n_batches = len(dataloader)
         if n_batches == 0:
             raise ValueError('Validation dataloader is empty')
@@ -650,7 +708,7 @@ class Trainer:
         effective_batches = min(n_batches, max_batches) if max_batches else n_batches
         processed_batches = 0
 
-        for batch in tqdm(dataloader, desc='Validating', total=effective_batches):
+        for batch in tqdm(dataloader, desc='Validating', total=effective_batches, disable=not self.is_main_process):
             images = batch['images'].to(self.device, non_blocking=True)
             text_input_ids = batch['text_input_ids'].to(self.device, non_blocking=True)
             text_attention_mask = batch['text_attention_mask'].to(self.device, non_blocking=True)
@@ -674,7 +732,9 @@ class Trainer:
             if cad_valid_mask.any():
                 cmd_pred = torch.argmax(cmd_logits, dim=-1)
                 cmd_gt_clamped = cmd_gt.clamp(min=0, max=cmd_logits.shape[-1] - 1)
-                cmd_token_acc_total += (cmd_pred == cmd_gt_clamped)[cad_valid_mask].float().mean().item()
+                cmd_matches = (cmd_pred == cmd_gt_clamped)[cad_valid_mask]
+                cmd_token_correct += cmd_matches.float().sum().item()
+                cmd_token_count += float(cmd_matches.numel())
 
                 param_pred = torch.argmax(param_logits, dim=-1)
                 cmd_mask = self.criterion.cmd_param_mask.to(param_pred.device)[
@@ -682,7 +742,9 @@ class Trainer:
                 ]
                 combined_mask = cad_valid_mask.unsqueeze(-1) & cmd_mask
                 if combined_mask.any():
-                    param_token_acc_total += (param_pred == param_gt)[combined_mask].float().mean().item()
+                    param_matches = (param_pred == param_gt)[combined_mask]
+                    param_token_correct += param_matches.float().sum().item()
+                    param_token_count += float(param_matches.numel())
 
                 token_cmd_correct = (cmd_pred == cmd_gt_clamped) & cad_valid_mask
                 active_param_counts = combined_mask.sum(dim=-1)
@@ -691,39 +753,58 @@ class Trainer:
                     token_param_correct = (~combined_mask | (param_pred == param_gt)).all(dim=-1)
                 token_exact = token_cmd_correct & token_param_correct & (active_param_counts > 0)
                 token_exact = token_exact | (token_cmd_correct & (active_param_counts == 0))
-                token_exact_acc_total += token_exact[cad_valid_mask].float().mean().item()
+                token_exact_valid = token_exact[cad_valid_mask]
+                token_exact_correct += token_exact_valid.float().sum().item()
+                token_exact_count += float(token_exact_valid.numel())
 
                 seq_cmd_exact = token_cmd_correct.all(dim=-1)
                 seq_exact = (token_exact | ~cad_valid_mask).all(dim=-1)
-                sequence_cmd_exact_acc_total += seq_cmd_exact.float().mean().item()
-                sequence_exact_acc_total += seq_exact.float().mean().item()
+                sequence_cmd_exact_correct += seq_cmd_exact.float().sum().item()
+                sequence_exact_correct += seq_exact.float().sum().item()
+                sequence_count += float(seq_exact.numel())
 
             if max_batches and processed_batches >= max_batches:
                 break
 
+        reduced = self._finalize_epoch_stats({
+            'loss_sum': total_loss,
+            'processed_batches': processed_batches,
+            'cmd_token_correct': cmd_token_correct,
+            'cmd_token_count': cmd_token_count,
+            'param_token_correct': param_token_correct,
+            'param_token_count': param_token_count,
+            'token_exact_correct': token_exact_correct,
+            'token_exact_count': token_exact_count,
+            'sequence_cmd_exact_correct': sequence_cmd_exact_correct,
+            'sequence_exact_correct': sequence_exact_correct,
+            'sequence_count': sequence_count,
+        })
+
         return {
-            'loss': total_loss / processed_batches,
-            'cmd_token_acc': cmd_token_acc_total / processed_batches,
-            'param_token_acc': param_token_acc_total / processed_batches,
-            'token_exact_acc': token_exact_acc_total / processed_batches,
-            'sequence_cmd_exact_acc': sequence_cmd_exact_acc_total / processed_batches,
-            'sequence_exact_acc': sequence_exact_acc_total / processed_batches,
+            'loss': reduced['loss_sum'] / max(reduced['processed_batches'], 1.0),
+            'cmd_token_acc': reduced['cmd_token_correct'] / max(reduced['cmd_token_count'], 1.0),
+            'param_token_acc': reduced['param_token_correct'] / max(reduced['param_token_count'], 1.0),
+            'token_exact_acc': reduced['token_exact_correct'] / max(reduced['token_exact_count'], 1.0),
+            'sequence_cmd_exact_acc': reduced['sequence_cmd_exact_correct'] / max(reduced['sequence_count'], 1.0),
+            'sequence_exact_acc': reduced['sequence_exact_correct'] / max(reduced['sequence_count'], 1.0),
         }
 
     def train(self, train_loader, val_loader, num_epochs):
         """完整训练循环"""
         local_num_epochs = max(num_epochs - self.epoch_offset, 0)
         if self.epoch >= local_num_epochs:
-            print(
+            self._rank_print(
                 f'Current local epoch {self.epoch} already reached configured training limit '
                 f'(num_epochs={num_epochs}, epoch_offset={self.epoch_offset}). Nothing to do.'
             )
-            self.writer.close()
+            if self.writer is not None:
+                self.writer.close()
             return
 
         for epoch in range(self.epoch, local_num_epochs):
             self.epoch = epoch
             effective_epoch = self._effective_epoch(epoch)
+            self._maybe_set_sampler_epoch(train_loader, effective_epoch)
             self._apply_lr_factor(epoch)
             self.scheduler.last_epoch = effective_epoch
             start_time = time.time()
@@ -734,19 +815,25 @@ class Trainer:
 
             if val_metrics['loss'] < self.best_val_loss:
                 self.best_val_loss = val_metrics['loss']
-                self.save_checkpoint('best.pth')
+                if self.is_main_process:
+                    self.save_checkpoint('best.pth')
 
-            if (effective_epoch + 1) % 10 == 0:
+            if self.is_main_process and (effective_epoch + 1) % 10 == 0:
                 self.save_checkpoint(f'epoch_{effective_epoch + 1}.pth')
 
             elapsed = time.time() - start_time
-            print(f'Epoch {effective_epoch}: train_loss={train_metrics["loss"]:.4f}, '
-                  f'val_loss={val_metrics["loss"]:.4f}, time={elapsed:.1f}s')
+            self._rank_print(
+                f'Epoch {effective_epoch}: train_loss={train_metrics["loss"]:.4f}, '
+                f'val_loss={val_metrics["loss"]:.4f}, time={elapsed:.1f}s'
+            )
 
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.close()
 
     def _log_metrics(self, train_metrics, val_metrics, epoch):
         """记录指标到 TensorBoard"""
+        if self.writer is None:
+            return
         for name, value in train_metrics.items():
             self.writer.add_scalar(f'train/{name}', value, epoch)
         for name, value in val_metrics.items():
@@ -765,7 +852,7 @@ class Trainer:
             'best_val_loss': self.best_val_loss,
             'config': self.config
         }, checkpoint_path)
-        print(f'Saved checkpoint to {checkpoint_path}')
+        self._rank_print(f'Saved checkpoint to {checkpoint_path}')
 
     def load_checkpoint(self, checkpoint_path):
         """加载检查点"""
@@ -775,13 +862,15 @@ class Trainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.epoch = checkpoint['epoch'] + 1
         self.best_val_loss = checkpoint['best_val_loss']
-        print(f'Loaded checkpoint from {checkpoint_path}')
+        self._rank_print(f'Loaded checkpoint from {checkpoint_path}')
 
     def load_model_weights(self, checkpoint_path):
         """仅从检查点加载模型参数，保留当前配置构建出的训练状态。"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self._load_state_dict_flexible(self._model_to_save(), checkpoint['model_state_dict'])
-        print(f'Loaded model weights from {checkpoint_path}; optimizer, scheduler, epoch, and best_val_loss were reset for a new run')
+        self._rank_print(
+            f'Loaded model weights from {checkpoint_path}; optimizer, scheduler, epoch, and best_val_loss were reset for a new run'
+        )
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, grad_clip=1.0):

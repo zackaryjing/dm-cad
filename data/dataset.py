@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from transformers import BertTokenizer
 
@@ -394,6 +395,9 @@ def build_dataloader(
     persistent_workers=None,
     prefetch_factor=1,
     max_prefetch_gb=DEFAULT_MAX_PREFETCH_GB,
+    distributed=False,
+    rank=0,
+    world_size=1,
 ):
     """构建数据加载器。"""
     dataset = CADDataset(
@@ -426,19 +430,37 @@ def build_dataloader(
                 effective_num_workers = max_workers_for_prefetch
         estimated_prefetched_batches = effective_num_workers * max(effective_prefetch_factor, 1)
 
+    sampler = None
+    shuffle = (split == 'train')
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+        shuffle = False
+
     loader_kwargs = {
         'dataset': dataset,
         'batch_size': batch_size,
-        'shuffle': (split == 'train'),
+        'shuffle': shuffle,
         'num_workers': effective_num_workers,
         'collate_fn': collate_fn,
         'pin_memory': pin_memory,
     }
+    if sampler is not None:
+        loader_kwargs['sampler'] = sampler
     if effective_num_workers > 0:
         loader_kwargs['persistent_workers'] = False if persistent_workers is None else persistent_workers
         loader_kwargs['prefetch_factor'] = effective_prefetch_factor
 
     dataloader = DataLoader(**loader_kwargs)
+    dataloader.distributed = distributed
+    dataloader.rank = rank
+    dataloader.world_size = world_size
+    dataloader.sampler_for_epoch = sampler
     dataloader.estimated_batch_gb = estimated_batch_bytes / (1024 ** 3)
     dataloader.estimated_prefetched_batches = estimated_prefetched_batches
     dataloader.estimated_prefetch_gb = (
