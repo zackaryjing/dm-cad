@@ -188,9 +188,13 @@ def main():
             else:
                 trainer.load_model_weights(args.resume)
 
-        default_num_workers = training_cfg['num_workers']
-        train_num_workers = int(training_cfg.get('train_num_workers', default_num_workers))
-        val_num_workers = int(training_cfg.get('val_num_workers', default_num_workers))
+        legacy_num_workers = training_cfg.get('num_workers')
+        train_num_workers = training_cfg.get('train_num_workers', legacy_num_workers)
+        val_num_workers = training_cfg.get('val_num_workers', legacy_num_workers)
+        if train_num_workers is None or val_num_workers is None:
+            raise ValueError('training.train_num_workers and training.val_num_workers must be set')
+        train_num_workers = int(train_num_workers)
+        val_num_workers = int(val_num_workers)
 
         _rank_print(dist_env, f'Loading training data from {data_root}...')
         _rank_print(dist_env, f'  Dataset backend: {data_backend}')

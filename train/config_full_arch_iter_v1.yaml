@@ -21,7 +21,8 @@ training:
   epoch_offset: 0
   warmup_epochs: 5
   gradient_clip: 0.5
-  num_workers: 24
+  train_num_workers: 12
+  val_num_workers: 8
   precision: bf16
   debug_monitor_enabled: false
   debug_log_every_batches: 10
