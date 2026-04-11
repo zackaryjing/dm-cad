@@ -3,6 +3,7 @@
 基于设计文档 4.2 节训练策略
 """
 
+import copy
 import os
 import time
 import math
@@ -446,15 +447,175 @@ class Trainer:
     def _model_to_save(self):
         return self.model.module if isinstance(self.model, (nn.DataParallel, DDP)) else self.model
 
-    def _load_state_dict_flexible(self, model, state_dict):
-        try:
-            model.load_state_dict(state_dict)
-        except RuntimeError:
-            stripped = {
-                key.replace('module.', '', 1) if key.startswith('module.') else key: value
-                for key, value in state_dict.items()
+    def _normalize_state_dict_keys(self, state_dict):
+        return {
+            key.replace('module.', '', 1) if key.startswith('module.') else key: value
+            for key, value in state_dict.items()
+        }
+
+    def _current_parameter_names(self, model):
+        return [name for name, _ in model.named_parameters()]
+
+    def _legacy_parameter_names(self, model):
+        current_names = self._current_parameter_names(model)
+        fusion_param_names = [name for name in current_names if name.startswith('modal_fusion.')]
+        if not fusion_param_names:
+            return current_names
+
+        fusion_type = getattr(model.modal_fusion, 'fusion_type', 'gating')
+        if fusion_type == 'gating':
+            active_names = {
+                'modal_fusion.gate_proj.0.weight',
+                'modal_fusion.gate_proj.0.bias',
+                'modal_fusion.gate_proj.2.weight',
+                'modal_fusion.gate_proj.2.bias',
+                'modal_fusion.norm.weight',
+                'modal_fusion.norm.bias',
             }
-            model.load_state_dict(stripped)
+        elif fusion_type == 'concat':
+            active_names = {
+                'modal_fusion.concat_proj.0.weight',
+                'modal_fusion.concat_proj.0.bias',
+                'modal_fusion.concat_proj.2.weight',
+                'modal_fusion.concat_proj.2.bias',
+                'modal_fusion.norm.weight',
+                'modal_fusion.norm.bias',
+            }
+        else:
+            active_names = {
+                'modal_fusion.cross_attention.in_proj_weight',
+                'modal_fusion.cross_attention.in_proj_bias',
+                'modal_fusion.cross_attention.out_proj.weight',
+                'modal_fusion.cross_attention.out_proj.bias',
+                'modal_fusion.norm.weight',
+                'modal_fusion.norm.bias',
+            }
+
+        if set(fusion_param_names) != active_names:
+            return current_names
+
+        legacy_fusion_names = [
+            'modal_fusion.gate_proj.0.weight',
+            'modal_fusion.gate_proj.0.bias',
+            'modal_fusion.gate_proj.2.weight',
+            'modal_fusion.gate_proj.2.bias',
+            'modal_fusion.concat_proj.0.weight',
+            'modal_fusion.concat_proj.0.bias',
+            'modal_fusion.concat_proj.2.weight',
+            'modal_fusion.concat_proj.2.bias',
+            'modal_fusion.cross_attention.in_proj_weight',
+            'modal_fusion.cross_attention.in_proj_bias',
+            'modal_fusion.cross_attention.out_proj.weight',
+            'modal_fusion.cross_attention.out_proj.bias',
+            'modal_fusion.norm.weight',
+            'modal_fusion.norm.bias',
+        ]
+        fusion_start = current_names.index(fusion_param_names[0])
+        fusion_end = fusion_start + len(fusion_param_names)
+        return current_names[:fusion_start] + legacy_fusion_names + current_names[fusion_end:]
+
+    def _load_state_dict_flexible(self, model, state_dict):
+        normalized = self._normalize_state_dict_keys(state_dict)
+        try:
+            model.load_state_dict(normalized)
+        except RuntimeError:
+            model_state = model.state_dict()
+            filtered = {}
+            missing = []
+            unexpected = []
+            shape_mismatches = []
+
+            for key, value in normalized.items():
+                if key not in model_state:
+                    unexpected.append(key)
+                    continue
+                if model_state[key].shape != value.shape:
+                    shape_mismatches.append(
+                        f'{key}: checkpoint={tuple(value.shape)} model={tuple(model_state[key].shape)}'
+                    )
+                    continue
+                filtered[key] = value
+
+            for key in model_state.keys():
+                if key not in filtered:
+                    missing.append(key)
+
+            model.load_state_dict(filtered, strict=False)
+
+            if unexpected:
+                self._rank_print(
+                    'Ignoring unexpected checkpoint parameters: '
+                    + ', '.join(unexpected[:8])
+                    + (' ...' if len(unexpected) > 8 else '')
+                )
+            if shape_mismatches:
+                self._rank_print(
+                    'Skipping checkpoint parameters with shape mismatch: '
+                    + '; '.join(shape_mismatches[:4])
+                    + (' ...' if len(shape_mismatches) > 4 else '')
+                )
+            if missing:
+                self._rank_print(
+                    'Model parameters initialized from current config instead of checkpoint: '
+                    + ', '.join(missing[:8])
+                    + (' ...' if len(missing) > 8 else '')
+                )
+
+    def _load_optimizer_state_flexible(self, optimizer_state_dict):
+        try:
+            self.optimizer.load_state_dict(optimizer_state_dict)
+            return
+        except ValueError:
+            pass
+
+        current_model = self._model_to_save()
+        current_names = self._current_parameter_names(current_model)
+        legacy_names = self._legacy_parameter_names(current_model)
+
+        current_optimizer_state = self.optimizer.state_dict()
+        current_ids = [param_id for group in current_optimizer_state['param_groups'] for param_id in group['params']]
+        old_groups = optimizer_state_dict.get('param_groups', [])
+        old_ids = [param_id for group in old_groups for param_id in group.get('params', [])]
+
+        if len(current_ids) != len(current_names) or len(old_ids) != len(legacy_names):
+            raise ValueError('Unable to remap optimizer state after model parameter changes')
+
+        old_name_by_id = dict(zip(old_ids, legacy_names))
+        current_id_by_name = dict(zip(current_names, current_ids))
+
+        remapped_state = {}
+        matched_names = []
+        skipped_names = []
+        for old_id, state in optimizer_state_dict.get('state', {}).items():
+            name = old_name_by_id.get(old_id)
+            if name is None:
+                continue
+            new_id = current_id_by_name.get(name)
+            if new_id is None:
+                skipped_names.append(name)
+                continue
+            remapped_state[new_id] = state
+            matched_names.append(name)
+
+        remapped_optimizer_state = copy.deepcopy(current_optimizer_state)
+        for group_idx, group in enumerate(remapped_optimizer_state['param_groups']):
+            if group_idx >= len(old_groups):
+                break
+            for key, value in old_groups[group_idx].items():
+                if key != 'params':
+                    group[key] = value
+        remapped_optimizer_state['state'] = remapped_state
+        self.optimizer.load_state_dict(remapped_optimizer_state)
+
+        if skipped_names:
+            self._rank_print(
+                'Dropped optimizer state for removed parameters: '
+                + ', '.join(skipped_names[:8])
+                + (' ...' if len(skipped_names) > 8 else '')
+            )
+        self._rank_print(
+            f'Remapped optimizer state for {len(matched_names)}/{len(current_names)} parameters after model cleanup.'
+        )
 
     def _maybe_set_sampler_epoch(self, dataloader, epoch):
         sampler = getattr(dataloader, 'sampler_for_epoch', None)
@@ -858,7 +1019,7 @@ class Trainer:
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self._load_state_dict_flexible(self._model_to_save(), checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self._load_optimizer_state_flexible(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.epoch = checkpoint['epoch'] + 1
         self.best_val_loss = checkpoint['best_val_loss']

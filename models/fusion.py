@@ -12,24 +12,34 @@ class ModalFusion(nn.Module):
 
     def __init__(self, embed_dim=512, fusion_type='gating', img_bias=0.7):
         super().__init__()
+        if fusion_type not in {'gating', 'concat', 'cross_attention'}:
+            raise ValueError(f'Unsupported fusion_type: {fusion_type}')
+
         self.fusion_type = fusion_type
         self.img_bias = img_bias
 
-        self.gate_proj = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, 1)
-        )
-        self.concat_proj = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.GELU(),
-            nn.LayerNorm(embed_dim)
-        )
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=8,
-            batch_first=True
-        )
+        self.gate_proj = None
+        self.concat_proj = None
+        self.cross_attention = None
+
+        if self.fusion_type == 'gating':
+            self.gate_proj = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, 1)
+            )
+        elif self.fusion_type == 'concat':
+            self.concat_proj = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.GELU(),
+                nn.LayerNorm(embed_dim)
+            )
+        else:
+            self.cross_attention = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=8,
+                batch_first=True
+            )
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, z_img, z_txt):
