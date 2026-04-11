@@ -188,17 +188,21 @@ def main():
             else:
                 trainer.load_model_weights(args.resume)
 
+        default_num_workers = training_cfg['num_workers']
+        train_num_workers = int(training_cfg.get('train_num_workers', default_num_workers))
+        val_num_workers = int(training_cfg.get('val_num_workers', default_num_workers))
+
         _rank_print(dist_env, f'Loading training data from {data_root}...')
         _rank_print(dist_env, f'  Dataset backend: {data_backend}')
         if data_backend == 'lmdb':
             _rank_print(dist_env, f'  LMDB path: {lmdb_path or "cad_data.lmdb"}')
-        _rank_print(dist_env, f'  Requested num_workers: {training_cfg["num_workers"]}')
+        _rank_print(dist_env, f'  Requested num_workers: {train_num_workers}')
         train_ids_file = data_cfg.get('train_ids_file')
         train_loader = build_dataloader(
             data_root=data_root,
             split='train',
             batch_size=training_cfg['batch_size'],
-            num_workers=training_cfg['num_workers'],
+            num_workers=train_num_workers,
             ids_file=train_ids_file,
             img_size=data_cfg.get('img_size', 224),
             text_max_len=data_cfg.get('text_max_len', 64),
@@ -228,13 +232,13 @@ def main():
         _rank_print(dist_env, f'  Dataset backend: {data_backend}')
         if data_backend == 'lmdb':
             _rank_print(dist_env, f'  LMDB path: {lmdb_path or "cad_data.lmdb"}')
-        _rank_print(dist_env, f'  Requested num_workers: {training_cfg["num_workers"]}')
+        _rank_print(dist_env, f'  Requested num_workers: {val_num_workers}')
         test_ids_file = data_cfg.get('test_ids_file')
         val_loader = build_dataloader(
             data_root=data_root,
             split='test',
             batch_size=training_cfg['batch_size'],
-            num_workers=training_cfg['num_workers'],
+            num_workers=val_num_workers,
             ids_file=test_ids_file,
             img_size=data_cfg.get('img_size', 224),
             text_max_len=data_cfg.get('text_max_len', 64),
