@@ -16,7 +16,7 @@ model:
   decoder_condition_scale: 1.0
 
 training:
-  batch_size: 240
+  batch_size: 256
   num_epochs: 500
   epoch_offset: 0
   warmup_epochs: 5
@@ -66,4 +66,4 @@ log:
 
 device:
   type: cuda
-  visible_devices: [3,4,5]
+  visible_devices: [1,2]
