@@ -11,17 +11,18 @@
 import argparse
 from pathlib import Path
 
-import torch
 import yaml
 from PIL import Image
-from torchvision import transforms
-from transformers import BertTokenizer
 
-from data.dataset import CADDataset
-from models.dual_modal_cad import DualModalCADGenerator
+from runtime_device import apply_visible_devices, resolve_device_type
 
 
 CMD_NAMES = ['Line', 'Arc', 'Circle', 'EOS', 'SOL', 'Ext']
+torch = None
+transforms = None
+BertTokenizer = None
+CADDataset = None
+DualModalCADGenerator = None
 
 
 def parse_args():
@@ -44,8 +45,8 @@ def parse_args():
                         help='Specific sample id for dataset-backed sample inference')
     parser.add_argument('--sample-ids-file', type=str, default=None,
                         help='Path to a text file containing one sample id per line for batch sample inference')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use for inference')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Optional device override, e.g. cuda or cpu')
     parser.add_argument('--max_steps', type=int, default=120,
                         help='Maximum number of CAD steps to generate')
     return parser.parse_args()
@@ -75,6 +76,26 @@ def resolve_device(device_arg):
         print('CUDA not available, using CPU')
         return 'cpu'
     return device_arg
+
+
+def ensure_runtime_imports():
+    global torch, transforms, BertTokenizer, CADDataset, DualModalCADGenerator
+
+    if torch is not None:
+        return
+
+    import torch as torch_module
+    from torchvision import transforms as transforms_module
+    from transformers import BertTokenizer as bert_tokenizer_cls
+
+    from data.dataset import CADDataset as cad_dataset_cls
+    from models.dual_modal_cad import DualModalCADGenerator as dual_modal_cad_generator_cls
+
+    torch = torch_module
+    transforms = transforms_module
+    BertTokenizer = bert_tokenizer_cls
+    CADDataset = cad_dataset_cls
+    DualModalCADGenerator = dual_modal_cad_generator_cls
 
 
 def _load_state_dict_flexible(model, state_dict):
@@ -255,7 +276,14 @@ def run_inference(model, sample, device, max_steps):
 def main():
     args = parse_args()
     config = load_config(args.config)
-    device = resolve_device(args.device)
+    visible_devices = apply_visible_devices(config)
+    ensure_runtime_imports()
+
+    requested_device = resolve_device_type(config, args.device)
+    device = resolve_device(requested_device)
+
+    if visible_devices:
+        print(f'Using CUDA_VISIBLE_DEVICES={visible_devices}')
     model = load_model(args.checkpoint, device)
 
     samples = load_manual_inputs(args)
