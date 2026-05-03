@@ -1,0 +1,22 @@
+{
+  "val_loss_best": {
+    "step": 112,
+    "value": 0.8327512741088867
+  },
+  "val_cmd_token_acc_best": {
+    "step": 112,
+    "value": 0.9244776964187622
+  },
+  "val_param_token_acc_best": {
+    "step": 118,
+    "value": 0.741500198841095
+  },
+  "val_token_exact_acc_best": {
+    "step": 118,
+    "value": 0.5836707949638367
+  },
+  "val_sequence_exact_acc_best": {
+    "step": 118,
+    "value": 0.13867320120334625
+  }
+}

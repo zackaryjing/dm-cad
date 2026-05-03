@@ -39,6 +39,18 @@ def parse_args():
         default=[],
         help="Optional sequence-length thresholds for extra conservative subsets",
     )
+    parser.add_argument(
+        "--heldout-ids-file",
+        type=Path,
+        default=None,
+        help="Optional held-out ids file. Samples sharing these base ids will be excluded from extra training supersets.",
+    )
+    parser.add_argument(
+        "--heldout-tag",
+        type=str,
+        default="heldout",
+        help="Tag suffix used in generated superset version names when --heldout-ids-file is provided.",
+    )
     return parser.parse_args()
 
 
@@ -95,6 +107,9 @@ def main():
             deep_phase_by_base[sample_id] = phase
 
     need_lengths = bool(args.length_thresholds)
+    heldout_sample_ids = read_lines(args.heldout_ids_file) if args.heldout_ids_file is not None else []
+    heldout_bases = {normalize_v0_id(sample_id) for sample_id in heldout_sample_ids}
+
     # Build per-sample metadata once so every subset is reproducible.
     records = []
     variants_by_base = defaultdict(list)
@@ -150,6 +165,16 @@ def main():
     }
 
     for threshold in sorted(set(args.length_thresholds)):
+        key_full = f"full_v0_len{threshold}"
+        versions[key_full] = {
+            split_name: sorted(
+                record["sample_id"]
+                for record in records
+                if record["v0_split"] == split_name and record["seq_len"] <= threshold
+            )
+            for split_name in ["train", "test"]
+        }
+
         key_all = f"overlap_deep_all_len{threshold}"
         versions[key_all] = {
             phase: sorted(
@@ -169,6 +194,17 @@ def main():
             )
             for phase in ["train", "validation", "test"]
         }
+
+        if heldout_bases:
+            key_superset = f"full_v0_len{threshold}_excluding_{args.heldout_tag}"
+            versions[key_superset] = {
+                "train": sorted(
+                    record["sample_id"]
+                    for record in records
+                    if record["seq_len"] <= threshold and record["base_id"] not in heldout_bases
+                ),
+                "test": sorted(heldout_sample_ids),
+            }
 
     # Persist ids.
     for version_name, split_map in versions.items():

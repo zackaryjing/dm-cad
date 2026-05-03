@@ -13,9 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deepcad_latent import DeepCADAdapter
+from deepcad_latent import ImageToCadPipeline
 from deepcad_latent.data import ImageLatentDataset, collate_image_latent
-from deepcad_latent.model import MultiViewLatentRegressor
 
 
 CMD_NAMES = {
@@ -42,6 +41,11 @@ def parse_args():
     parser.add_argument("--n-views", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=4)
+    parser.add_argument("--retrieval-latent-root", type=Path, default=None)
+    parser.add_argument("--retrieval-mode", type=str, default="direct", choices=["direct", "nearest", "blend"])
+    parser.add_argument("--retrieval-metric", type=str, default="cosine", choices=["cosine", "l2"])
+    parser.add_argument("--retrieval-topk", type=int, default=1)
+    parser.add_argument("--blend-alpha", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -65,8 +69,6 @@ def format_sequence(cad_vec) -> list[dict]:
 
 def main():
     args = parse_args()
-    device = torch.device(args.device)
-
     dataset = ImageLatentDataset(
         ids_file=args.ids,
         latent_root=args.latent_root,
@@ -84,35 +86,44 @@ def main():
         collate_fn=collate_image_latent,
     )
 
-    model = MultiViewLatentRegressor(
-        backbone_name=args.backbone,
+    pipeline = ImageToCadPipeline(
+        checkpoint_path=args.checkpoint,
+        device=args.device,
+        backbone=args.backbone,
         n_views=args.n_views,
         freeze_backbone=args.freeze_backbone,
-    ).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
-
-    adapter = DeepCADAdapter(device=args.device)
+        retrieval_latent_root=args.retrieval_latent_root,
+        retrieval_metric=args.retrieval_metric,
+    )
 
     batch = next(iter(loader))
-    images = batch["images"].to(device)
+    images = batch["images"]
     gt_z = batch["z"]
-    with torch.no_grad():
-        pred_z = model(images).cpu()
+    pred_z = pipeline.predict_latent(images)
+    resolved = pipeline.resolve_latent(
+        pred_z,
+        mode=args.retrieval_mode,
+        topk=args.retrieval_topk,
+        blend_alpha=args.blend_alpha,
+    )
+    final_z = resolved["final_z"]
 
-    pred_cad = adapter.decode(pred_z)
-    gt_cad = adapter.decode(gt_z)
+    pred_cad = pipeline.decode_latent(final_z)
+    gt_cad = pipeline.decode_latent(gt_z)
 
     results = []
-    for sample_id, pred_seq, gt_seq in zip(batch["sample_ids"], pred_cad, gt_cad):
-        results.append(
-            {
-                "sample_id": sample_id,
-                "pred_sequence": format_sequence(pred_seq),
-                "gt_sequence_from_latent": format_sequence(gt_seq),
-            }
-        )
+    retrieval = resolved["retrieval"]
+    for index, (sample_id, pred_seq, gt_seq) in enumerate(zip(batch["sample_ids"], pred_cad, gt_cad)):
+        row = {
+            "sample_id": sample_id,
+            "pred_sequence": format_sequence(pred_seq),
+            "gt_sequence_from_latent": format_sequence(gt_seq),
+            "retrieval_mode": args.retrieval_mode,
+        }
+        if retrieval is not None:
+            row["retrieved_sample_ids"] = retrieval["sample_ids"][index]
+            row["retrieval_scores"] = retrieval["scores"][index].tolist()
+        results.append(row)
 
     print(json.dumps(results, indent=2, ensure_ascii=False))
 

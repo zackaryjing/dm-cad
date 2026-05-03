@@ -1,277 +1,66 @@
-# Dual-Modal CAD Generator (DM-CAD)
+# DM-CAD Rescue Branch
 
-基于多视图图像与文本描述的参数化 CAD 序列生成网络
+This branch no longer contains the old end-to-end autoregressive CAD generator.
+It is now focused on a lower-risk pipeline built on top of a frozen DeepCAD latent space.
 
-## 项目结构
+## Current Route
 
-```
-dmcad/
-├── models/
-│   ├── __init__.py
-│   ├── view_encoder.py      # 视图编码器 (ViT + 多视图融合)
-│   ├── text_encoder.py      # 文本编码器 (BERT)
-│   ├── fusion.py            # 双模态融合模块
-│   ├── cad_decoder.py       # CAD 序列解码器 (6 命令类型，19 参数)
-│   └── dual_modal_cad.py    # 完整模型
-├── data/
-│   ├── __init__.py
-│   ├── dataset.py           # 数据集类 (DeepCAD 格式)
-│   ├── renderer.py          # CAD 渲染 pipeline
-│   └── augment.py           # 数据增强
-├── train/
-│   ├── __init__.py
-│   ├── train.py             # 训练脚本
-│   ├── loss.py              # 损失函数 (6 命令类型掩码)
-│   └── config.yaml          # 配置文件
-├── eval/
-│   ├── __init__.py
-│   ├── evaluate.py          # 评估脚本
-│   └── metrics.py           # 评估指标
-├── utils/
-│   ├── __init__.py
-│   ├── visualize.py         # 可视化工具
-│   └── export_step.py       # STEP 导出
-├── train_main.py            # 训练入口
-├── eval_main.py             # 评估入口
-├── infer.py                 # 推理入口
-├── requirements.txt         # 依赖列表
-└── README.md                # 本文件
-```
+- `images -> latent z -> DeepCAD decoder`
+- DeepCAD autoencoder stays frozen
+- current working baseline: image-only
+- current extension under implementation: image + text
 
-## 安装
+Core code lives in:
+
+- `deepcad_latent/`
+- `scripts/train_image_to_latent.py`
+- `scripts/evaluate_image_to_cad.py`
+- `scripts/web_image_to_cad.py`
+- `scripts/precompute_deepcad_latents.py`
+- `scripts/precompute_text_embeddings.py`
+- `scripts/train_image_text_to_latent.py`
+
+## Data Assets
+
+Important dataset ids and latent roots are summarized in:
+
+- `runs/deepcad_latent/EXPERIMENT_SNAPSHOT_2026-04-16.md`
+- `runs/deepcad_latent/experiment_manifest.json`
+
+## Typical Workflow
+
+1. Prepare ids
 
 ```bash
-# 创建 conda 环境
-conda activate /home/jing/allprojects/pythonenvironment/dmcad
-
-# 依赖已在 environment.yml 中定义
+python scripts/prepare_rescue_ids.py --length-thresholds 60
 ```
 
-## 训练
+2. Precompute DeepCAD latents
 
 ```bash
-# 单卡训练
-python train_main.py --config train/config.yaml
-
-# 多卡训练（推荐，自动启用 DDP）
-torchrun --nproc_per_node=2 train_main.py --config train/config_full_arch_iter_v1.yaml
-
-# 从检查点恢复训练（继续写入该 checkpoint 所在的 run 目录）
-python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/checkpoints/epoch_10.pth
-
-# 从旧 checkpoint 初始化参数，但创建新的 run 目录继续实验
-# 这种模式只加载模型权重；optimizer、scheduler、epoch、best_val_loss 都会按新训练重置
-python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/checkpoints/epoch_10.pth --no-resume-in-place
+python scripts/precompute_deepcad_latents.py ...
 ```
 
-**配置说明** (`train/config.yaml`):
-- `data.data_root`: 数据集根目录 (默认：`datasets/dataset_v1`)
-- `data.train_ids_file`: 训练集 ids 文件 (**相对于 data_root**)
-- `data.test_ids_file`: 测试集 ids 文件 (**相对于 data_root**)
-- `training.epoch_offset`: 可选；用于从中间 epoch 对齐学习率调度和 checkpoint 编号
-- `training.precision`: `fp32` / `fp16` / `bf16`
-- `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
-- `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
-- `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`
-- `data.persistent_workers`: 是否在 epoch 间保留 worker 进程，默认 `false`
-- `data.prefetch_factor`: 每个 worker 预取的 batch 数，默认 `1`
-- `data.max_prefetch_gb`: DataLoader 允许的预取图像内存预算上限（GiB）；会据此自动下调有效 `num_workers`
-- `loss.cmd_weight` / `loss.param_weight`: 命令 CE 和参数 CE 的权重
-- `loss.n_param_bins`: 参数离散分类桶数；当前参数严格使用 `0..255`，因此默认 `256`
-
-### 分布式训练说明
-
-- 多卡训练通过 `torchrun` 自动进入 DDP，不再依赖 `DataParallel`
-- 运行时会自动读取 `LOCAL_RANK/RANK/WORLD_SIZE`
-- 只有 rank 0 会打印主日志、写 TensorBoard、保存 checkpoint
-- 训练和验证指标都会做跨进程聚合，看到的是全局值
-- `device.visible_devices` 仍用于设置 `CUDA_VISIBLE_DEVICES`
-
-## 评估
+3. Train image-only model
 
 ```bash
-# 在测试集上评估
-# 默认会把 metrics 保存到该 checkpoint 所在 run 目录下的 eval/ 子目录
-python eval_main.py --checkpoint checkpoints/best.pth
-
-# 相对 --output/--metrics_output 也会默认解析到该 run 的 eval/ 子目录
-python eval_main.py     --checkpoint checkpoints/best.pth     --output generated.pt     --metrics_output metrics.yaml
+torchrun --nproc_per_node=2 scripts/train_image_to_latent.py ...
 ```
 
-## 推理
+4. Evaluate direct / nearest / blend
 
 ```bash
-# 方式 1：使用 8 视图图像和文本描述生成 CAD 序列
-python infer.py     --checkpoint checkpoints/best.pth     --images view_00.png view_01.png ... view_07.png     --text "A rectangular box with a cylindrical hole through the center"
-
-# 方式 2：直接从配置里的 test_ids 中选一个测试样本跑推理
-python infer.py     --checkpoint checkpoints/best.pth     --config train/config_5k.yaml     --split test     --sample-index 0     --device cuda
+python scripts/evaluate_image_to_cad.py ...
 ```
 
-## 模型架构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    DM-CAD Architecture                       │
-├─────────────────────────────────────────────────────────────┤
-│  Image Branch (8 views)    Text Branch                      │
-│  ┌───────────┐             ┌───────────┐                    │
-│  │ ViT-Base  │             │ BERT-Base │                    │
-│  └───────────┘             └───────────┘                    │
-│       ↓                         ↓                           │
-│  Multi-View Fusion        Adapt Layer                       │
-│       ↓                         ↓                           │
-│     z_img [512]            z_txt [512]                      │
-│              ↓               ↓                              │
-│         Modal Fusion (Gating)                      │
-│                    ↓                                        │
-│              z_fused [512]                                  │
-│                    ↓                                        │
-│         CAD Decoder (Transformer)                           │
-│                    ↓                                        │
-│    Command Head    Parameter Head                           │
-│    (6 classes)     (19 dim)                                 │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 数据集格式
-
-使用 DeepCAD 原始格式，数据组织如下：
-
-```
-datasets/dataset_v1/
-├── train_ids_5k.txt         # 训练样本 ID 列表
-├── test_ids_5k.txt          # 测试样本 ID 列表
-├── cad_desc/
-│   └── <group_id>.json      # 文本描述 (按 group_id 组织)
-├── cad_img/
-│   └── <group_id>/
-│       └── <sample_id>/
-│           ├── <sample_id>_000.png
-│           ├── <sample_id>_001.png
-│           └── ... (8 个视图)
-└── cad_vec/
-    └── <group_id>/
-        └── <sample_id>.h5   # CAD 向量序列
-```
-
-### LMDB 格式
-
-项目支持将散文件数据集预打包为单个 LMDB 数据库，以减少大量小文件随机读取造成的 I/O 抖动。
-
-推荐构建命令：
+5. Launch qualitative web inspector
 
 ```bash
-python -m data.build_lmdb \
-    --data-root datasets/dataset_v0 \
-    --output datasets/dataset_v0/cad_data.lmdb \
-    --ids-files train_ids.txt test_ids.txt
+python scripts/web_image_to_cad.py ...
 ```
 
-启用 LMDB 时，在配置文件中添加：
+## Current Presentation Recommendation
 
-```yaml
-data:
-  backend: lmdb
-  lmdb_path: cad_data.lmdb
-```
-
-LMDB 中每个 sample 使用 `group_id/sample_name` 作为 key，value 包含：
-- 8 视图图像的原始 PNG bytes
-- 文本描述
-- `float32 [seq_len, 20]` 的 CAD 序列
-
-## 关键设计说明
-
-### 命令类型 (6 种，DeepCAD 格式)
-
-| ID | 名称 | 说明 | 有效参数维度 |
-|----|------|------|-------------|
-| 0 | Line | 线段 | x, y (终点坐标) |
-| 1 | Arc | 圆弧 | x, y, alpha, f |
-| 2 | Circle | 圆 | x, y, r |
-| 3 | EOS | 序列结束 | 无 |
-| 4 | SOL | 实体开始 | 无 |
-| 5 | Ext | 拉伸 | 11 维挤压参数 |
-
-### CAD 序列格式
-
-- **Shape**: `[seq_len, 20]`
-- **结构**: `[cmd_type, param_0, param_1, ..., param_18]`
-  - `cmd_type`: 命令类型 (0-5)
-  - `param_*`: 19 维参数
-
-### 张量维度说明
-
-| 模块 | 输入 | 输出 |
-|------|------|------|
-| ViewEncoder | `[B, 3, 224, 224]` | `[B, 512]` |
-| MultiViewFusion | `[B, 8, 512]` | `[B, 512]` |
-| TextEncoder | `[B, seq_len]` | `[B, 512]` |
-| ModalFusion | `[B, 512], [B, 512]` | `[B, 512]` |
-| CADDecoder | `[B, 512], [B, T, 20]` | `[B, T, 6]`, `[B, T, 19, 256]` |
-
-### 损失函数
-
-```
-L_total = cmd_weight * L_cmd + param_weight * L_param
-
-L_cmd = CrossEntropy(cmd_logits, cmd_gt)  # 6 类
-L_param = CrossEntropy(param_logits, param_gt)  # 19 个参数位，各自做 256 类分类，仅在命令有效位置计算
-```
-
-当前设计原则：
-
-- `cmd` 和 `param` 都视为离散分类任务
-- `EOS` 仅作为普通命令类别处理，不再单独引入 `eos_loss`
-- 不再使用 `param_scale`、`tanh`、`param curriculum`
-- 参数监督默认按 `0..255` 的精确离散值学习
-
-## 评估指标
-
-| 指标 | 说明 |
-|------|------|
-| `cmd_token_acc` | 有效 token 上命令类别的准确率 |
-| `param_token_acc` | 有效参数位上的精确匹配率 |
-| `token_exact_acc` | 一个 token 上命令和该 token 所有有效参数都预测正确的比例 |
-| `sequence_cmd_exact_acc` | 整条序列命令全对的比例 |
-| `sequence_exact_acc` | 整条序列命令和所有有效参数都全对的比例 |
-
-## 常见问题
-
-### 数据路径问题
-- ids 文件路径**相对于 `data_root`**，在 `train/config.yaml` 中配置
-- 训练时不需传递 `--data_dir`，直接从配置文件读取
-
-### DataLoader 内存控制
-- `pin_memory`: 让 CPU 到 GPU 的拷贝更快，但会增加主机侧 pinned memory 占用
-- `persistent_workers`: 若为 `true`，worker 不会在每个 epoch 结束后退出；吞吐更稳，但长期占用更多内存与进程资源
-- `prefetch_factor`: 每个 worker 在后台提前准备多少个 batch；值越大，吞吐潜力越高，但更容易堆积大量 batch 内存
-- `max_prefetch_gb`: 预取图像张量的估算内存预算上限；DataLoader 会按 `batch_size × 8 × 3 × H × W × 4 bytes` 估算单 batch 图像内存，并自动限制有效 `num_workers`
-- 对于大 batch 训练，建议保持 `prefetch_factor=1`，再根据机器内存逐步增加 `max_prefetch_gb`
-
-### Epoch Offset
-- `training.epoch_offset` 用于从中间 checkpoint 开新 run 时，对齐学习率调度、TensorBoard 横轴和 checkpoint 编号
-- 它不会改变模型参数本身，只改变“这次 run 对应全局第几个 epoch”的解释
-- 若不需要从中间 epoch 对齐，保持 `0` 即可
-
-### 命令类型不匹配
-- 模型使用 **6 种命令类型** (DeepCAD 原始格式)
-- 早期设计使用 4 种命令类型 (START/SKETCH/EXTRUDE/END)，已过时
-
-### 维度不匹配
-- CAD 序列：20 维 = 1 命令类型 + 19 参数
-- 当前参数头输出不是 `[B, T, 19]` 回归值，而是 `[B, T, 19, 256]` 分类 logits
-- 参数预测输出：**19 维** (不是 20 维)
-- `cad_valid_mask` 过滤无效位置 (cmd_type < 0)
-
-## 参考文献
-
-1. DeepCAD: A Deep Generative Network for Computer-Aided Design Models (ICCV 2021)
-2. Text2CAD: Generating Sequential CAD Designs from Text Prompts (NeurIPS 2024)
-3. Automatic Reverse Engineering: Creating CAD Models from Multi-View Images (GCPR 2023)
-4. CAD-MLLM: Unifying Multimodality-Conditioned CAD Generation With MLLM (arXiv 2024)
-
-## License
-
-MIT License
+- baseline: `direct`
+- main improved method: `blend(alpha=0.5)`
+- analysis / upper-bound: `nearest`

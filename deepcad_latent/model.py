@@ -62,12 +62,87 @@ class MultiViewLatentRegressor(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def encode_images(self, images: torch.Tensor) -> torch.Tensor:
         batch_size, n_views, channels, height, width = images.shape
         if n_views != self.n_views:
             raise ValueError(f"Expected {self.n_views} views but got {n_views}")
 
         features = self.backbone(images.view(batch_size * n_views, channels, height, width))
         features = features.flatten(1).view(batch_size, n_views, -1)
-        fused = self.fusion(features)
+        return self.fusion(features)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        fused = self.encode_images(images)
         return self.head(fused)
+
+
+class TextResidualFusion(nn.Module):
+    def __init__(self, text_dim: int = 768, latent_dim: int = 256, hidden_dim: int = 512):
+        super().__init__()
+        self.text_proj = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        fusion_dim = latent_dim * 4
+        self.gate = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.Sigmoid(),
+        )
+        self.delta = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, z_img: torch.Tensor, text_emb: torch.Tensor, text_dropout_p: float = 0.0) -> torch.Tensor:
+        z_txt = self.text_proj(text_emb)
+        if self.training and text_dropout_p > 0.0:
+            keep = (torch.rand(z_txt.shape[0], 1, device=z_txt.device) >= text_dropout_p).to(z_txt.dtype)
+            z_txt = z_txt * keep
+        fuse = torch.cat([z_img, z_txt, z_img - z_txt, z_img * z_txt], dim=-1)
+        gate = self.gate(fuse)
+        delta = self.delta(fuse)
+        return torch.tanh(z_img + gate * delta)
+
+
+class MultiModalLatentRegressor(nn.Module):
+    def __init__(
+        self,
+        backbone_name: str = "resnet18",
+        n_views: int = 8,
+        latent_dim: int = 256,
+        image_hidden_dim: int = 512,
+        text_dim: int = 768,
+        freeze_backbone: bool = False,
+        text_dropout_p: float = 0.3,
+    ):
+        super().__init__()
+        self.image_model = MultiViewLatentRegressor(
+            backbone_name=backbone_name,
+            n_views=n_views,
+            latent_dim=latent_dim,
+            hidden_dim=image_hidden_dim,
+            freeze_backbone=freeze_backbone,
+        )
+        self.fusion = TextResidualFusion(text_dim=text_dim, latent_dim=latent_dim, hidden_dim=image_hidden_dim)
+        self.text_dropout_p = text_dropout_p
+
+    def freeze_image_branch(self, freeze: bool = True):
+        for param in self.image_model.parameters():
+            param.requires_grad = not freeze
+
+    def load_image_checkpoint(self, checkpoint_path: str | Path):
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        state = ckpt["model"]
+        missing, unexpected = self.image_model.load_state_dict(state, strict=False)
+        return {"missing_keys": missing, "unexpected_keys": unexpected}
+
+    def forward(self, images: torch.Tensor, text_emb: torch.Tensor) -> torch.Tensor:
+        z_img = self.image_model(images)
+        return self.fusion(z_img, text_emb, text_dropout_p=self.text_dropout_p)

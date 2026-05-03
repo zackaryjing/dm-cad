@@ -70,6 +70,8 @@ class DeepCADAdapter:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.to(self.device)
         self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
         self.max_total_len = int(self.cfg.max_total_len)
 
         _ensure_deepcad_importable()
@@ -124,8 +126,7 @@ class DeepCADAdapter:
         z = self.model(commands, args, encode_mode=True)
         return z[:, 0, :]
 
-    @torch.no_grad()
-    def decode_logits(self, z_batch: torch.Tensor | np.ndarray) -> dict[str, torch.Tensor]:
+    def _prepare_z_batch(self, z_batch: torch.Tensor | np.ndarray) -> torch.Tensor:
         if not torch.is_tensor(z_batch):
             z_batch = torch.as_tensor(z_batch, dtype=torch.float32, device=self.device)
         else:
@@ -134,6 +135,15 @@ class DeepCADAdapter:
             z_batch = z_batch.unsqueeze(1)
         elif z_batch.ndim != 3:
             raise ValueError(f"Expected z batch with ndim 2 or 3, got shape {tuple(z_batch.shape)}")
+        return z_batch
+
+    def decode_logits_with_grad(self, z_batch: torch.Tensor | np.ndarray) -> dict[str, torch.Tensor]:
+        z_batch = self._prepare_z_batch(z_batch)
+        return self.model(None, None, z=z_batch, return_tgt=False)
+
+    @torch.no_grad()
+    def decode_logits(self, z_batch: torch.Tensor | np.ndarray) -> dict[str, torch.Tensor]:
+        z_batch = self._prepare_z_batch(z_batch)
         return self.model(None, None, z=z_batch, return_tgt=False)
 
     @torch.no_grad()
