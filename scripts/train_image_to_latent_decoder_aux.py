@@ -36,6 +36,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet34"])
     parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument("--fusion-type", type=str, default="gru", choices=["gru", "gru_attn", "transformer"])
+    parser.add_argument("--transformer-layers", type=int, default=2)
+    parser.add_argument("--transformer-heads", type=int, default=8)
+    parser.add_argument("--transformer-dropout", type=float, default=0.1)
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--n-views", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -47,8 +51,21 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--init-checkpoint", type=Path)
     parser.add_argument("--latent-loss-weight", type=float, default=1.0)
-    parser.add_argument("--cmd-loss-weight", type=float, default=0.1)
-    parser.add_argument("--param-loss-weight", type=float, default=0.1)
+    parser.add_argument("--cmd-loss-weight", type=float, default=0.01)
+    parser.add_argument("--param-loss-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--aux-start-epoch",
+        type=int,
+        default=4,
+        help="Enable decoder auxiliary losses starting from this epoch (1-indexed).",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        type=str,
+        default="latent_mse",
+        choices=["latent_mse", "total_loss", "cosine"],
+        help="Metric used to choose best.pt.",
+    )
     parser.add_argument("--deepcad-checkpoint", type=Path)
     return parser.parse_args()
 
@@ -136,7 +153,13 @@ def compute_decoder_aux_losses(
     return loss_cmd, loss_args
 
 
-def evaluate(model, decoder_adapter, loader, device, args):
+def get_aux_weights(args, epoch: int) -> tuple[float, float]:
+    if epoch < args.aux_start_epoch:
+        return 0.0, 0.0
+    return args.cmd_loss_weight, args.param_loss_weight
+
+
+def evaluate(model, decoder_adapter, loader, device, args, epoch: int):
     model.eval()
     total_meter = RunningAverage()
     latent_meter = RunningAverage()
@@ -164,10 +187,11 @@ def evaluate(model, decoder_adapter, loader, device, args):
                 cmd_args_mask=decoder_adapter.cmd_args_mask,
                 eos_idx=decoder_adapter.eos_idx,
             )
+            eval_cmd_w, eval_param_w = get_aux_weights(args, epoch=epoch)
             total_loss = (
                 args.latent_loss_weight * latent_loss
-                + args.cmd_loss_weight * cmd_loss
-                + args.param_loss_weight * param_loss
+                + eval_cmd_w * cmd_loss
+                + eval_param_w * param_loss
             )
 
             batch_size = images.shape[0]
@@ -229,6 +253,10 @@ def main():
         backbone_name=args.backbone,
         n_views=args.n_views,
         freeze_backbone=args.freeze_backbone,
+        fusion_type=args.fusion_type,
+        transformer_layers=args.transformer_layers,
+        transformer_heads=args.transformer_heads,
+        transformer_dropout=args.transformer_dropout,
     ).to(device)
 
     if args.init_checkpoint is not None:
@@ -248,7 +276,10 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     history = []
-    best_test_total = float("inf")
+    if args.selection_metric == "cosine":
+        best_selection_value = float("-inf")
+    else:
+        best_selection_value = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         if train_sampler is not None:
@@ -260,6 +291,7 @@ def main():
         cmd_meter = RunningAverage()
         param_meter = RunningAverage()
         cos_meter = RunningAverage()
+        cmd_weight, param_weight = get_aux_weights(args, epoch)
 
         for step, batch in enumerate(train_loader, start=1):
             images = batch["images"].to(device, non_blocking=True)
@@ -282,8 +314,8 @@ def main():
             )
             total_loss = (
                 args.latent_loss_weight * latent_loss
-                + args.cmd_loss_weight * cmd_loss
-                + args.param_loss_weight * param_loss
+                + cmd_weight * cmd_loss
+                + param_weight * param_loss
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -302,12 +334,14 @@ def main():
                     f"epoch {epoch:03d} step {step:05d}/{len(train_loader):05d} "
                     f"train_total={total_meter.avg:.6f} train_mse={latent_meter.avg:.6f} "
                     f"train_cmd={cmd_meter.avg:.6f} train_param={param_meter.avg:.6f} "
-                    f"train_cos={cos_meter.avg:.6f}"
+                    f"train_cos={cos_meter.avg:.6f} aux_w=({cmd_weight:.4f},{param_weight:.4f})"
                 )
 
-        test_metrics = evaluate(model, decoder_adapter, test_loader, device, args)
+        test_metrics = evaluate(model, decoder_adapter, test_loader, device, args, epoch=epoch)
         epoch_metrics = {
             "epoch": epoch,
+            "aux_cmd_weight": cmd_weight,
+            "aux_param_weight": param_weight,
             "train_total_loss": total_meter.avg,
             "train_latent_mse": latent_meter.avg,
             "train_cmd_loss": cmd_meter.avg,
@@ -333,8 +367,17 @@ def main():
                 "metrics": epoch_metrics,
             }
             torch.save(payload, latest_path)
-            if test_metrics["total_loss"] < best_test_total:
-                best_test_total = test_metrics["total_loss"]
+            if args.selection_metric == "latent_mse":
+                selection_value = test_metrics["latent_mse"]
+                improved = selection_value < best_selection_value
+            elif args.selection_metric == "total_loss":
+                selection_value = test_metrics["total_loss"]
+                improved = selection_value < best_selection_value
+            else:
+                selection_value = test_metrics["cosine"]
+                improved = selection_value > best_selection_value
+            if improved:
+                best_selection_value = selection_value
                 torch.save(payload, args.output_dir / "best.pt")
             with (args.output_dir / "history.json").open("w") as f:
                 json.dump(history, f, indent=2)

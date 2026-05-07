@@ -37,6 +37,97 @@ class GRUFusion(nn.Module):
         return self.proj(h_n)
 
 
+class GRUAttentionFusion(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_dim,
+            hidden_dim,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.score = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.proj = nn.Linear(hidden_dim * 2, hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = self.gru(x)
+        attn_logits = self.score(output).squeeze(-1)
+        attn = torch.softmax(attn_logits, dim=1).unsqueeze(-1)
+        pooled = (output * attn).sum(dim=1)
+        return self.proj(pooled)
+
+
+class ViewTokenTransformerFusion(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        n_views: int,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_views = n_views
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_views + 1, hidden_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden_dim)
+        nn.init.normal_(self.cls_token, std=0.02)
+        nn.init.normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, n_views, _ = x.shape
+        if n_views != self.n_views:
+            raise ValueError(f"Expected {self.n_views} views but got {n_views}")
+        tokens = self.input_proj(x)
+        cls = self.cls_token.expand(batch_size, -1, -1)
+        tokens = torch.cat([cls, tokens], dim=1)
+        tokens = tokens + self.pos_embed[:, : n_views + 1]
+        encoded = self.encoder(tokens)
+        return self.norm(encoded[:, 0, :])
+
+
+def build_view_fusion(
+    fusion_type: str,
+    input_dim: int,
+    hidden_dim: int,
+    n_views: int,
+    transformer_layers: int,
+    transformer_heads: int,
+    transformer_dropout: float,
+) -> nn.Module:
+    if fusion_type == "gru":
+        return GRUFusion(input_dim, hidden_dim)
+    if fusion_type == "gru_attn":
+        return GRUAttentionFusion(input_dim, hidden_dim)
+    if fusion_type == "transformer":
+        return ViewTokenTransformerFusion(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            n_views=n_views,
+            num_layers=transformer_layers,
+            num_heads=transformer_heads,
+            dropout=transformer_dropout,
+        )
+    raise ValueError(f"Unsupported fusion_type: {fusion_type}")
+
+
 class MultiViewLatentRegressor(nn.Module):
     def __init__(
         self,
@@ -45,11 +136,24 @@ class MultiViewLatentRegressor(nn.Module):
         latent_dim: int = 256,
         hidden_dim: int = 512,
         freeze_backbone: bool = False,
+        fusion_type: str = "gru",
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
+        transformer_dropout: float = 0.1,
     ):
         super().__init__()
         self.n_views = n_views
+        self.fusion_type = fusion_type
         self.backbone, feat_dim = build_resnet_backbone(backbone_name)
-        self.fusion = GRUFusion(feat_dim, hidden_dim)
+        self.fusion = build_view_fusion(
+            fusion_type=fusion_type,
+            input_dim=feat_dim,
+            hidden_dim=hidden_dim,
+            n_views=n_views,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            transformer_dropout=transformer_dropout,
+        )
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -121,6 +225,10 @@ class MultiModalLatentRegressor(nn.Module):
         text_dim: int = 768,
         freeze_backbone: bool = False,
         text_dropout_p: float = 0.3,
+        fusion_type: str = "gru",
+        transformer_layers: int = 2,
+        transformer_heads: int = 8,
+        transformer_dropout: float = 0.1,
     ):
         super().__init__()
         self.image_model = MultiViewLatentRegressor(
@@ -129,6 +237,10 @@ class MultiModalLatentRegressor(nn.Module):
             latent_dim=latent_dim,
             hidden_dim=image_hidden_dim,
             freeze_backbone=freeze_backbone,
+            fusion_type=fusion_type,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            transformer_dropout=transformer_dropout,
         )
         self.fusion = TextResidualFusion(text_dim=text_dim, latent_dim=latent_dim, hidden_dim=image_hidden_dim)
         self.text_dropout_p = text_dropout_p

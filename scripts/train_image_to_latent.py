@@ -35,6 +35,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet34"])
     parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument("--fusion-type", type=str, default="gru", choices=["gru", "gru_attn", "transformer"])
+    parser.add_argument("--transformer-layers", type=int, default=2)
+    parser.add_argument("--transformer-heads", type=int, default=8)
+    parser.add_argument("--transformer-dropout", type=float, default=0.1)
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--n-views", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -42,6 +46,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--resume", type=Path, default=None, help="Resume from a saved latest/best checkpoint")
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -109,6 +114,23 @@ def evaluate(model, loader, device):
     return {"mse": mse_meter.avg, "cosine": cos_meter.avg}
 
 
+def load_history(output_dir: Path):
+    history_path = output_dir / "history.json"
+    if history_path.exists():
+        with history_path.open("r") as f:
+            return json.load(f)
+    return []
+
+
+def dedupe_history(history: list[dict], resume_epoch: int | None = None) -> list[dict]:
+    if resume_epoch is not None:
+        history = [entry for entry in history if int(entry.get("epoch", -1)) <= resume_epoch]
+    deduped = {}
+    for entry in history:
+        deduped[int(entry["epoch"])] = entry
+    return [deduped[epoch] for epoch in sorted(deduped)]
+
+
 def main():
     args = parse_args()
     setup_seed(args.seed)
@@ -147,6 +169,10 @@ def main():
         backbone_name=args.backbone,
         n_views=args.n_views,
         freeze_backbone=args.freeze_backbone,
+        fusion_type=args.fusion_type,
+        transformer_layers=args.transformer_layers,
+        transformer_heads=args.transformer_heads,
+        transformer_dropout=args.transformer_dropout,
     ).to(device)
 
     if distributed:
@@ -161,8 +187,41 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     history = []
     best_test_mse = float("inf")
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location="cpu")
+        model_state = checkpoint["model"]
+        if isinstance(model, DDP):
+            model.module.load_state_dict(model_state)
+        else:
+            model.load_state_dict(model_state)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+            group["weight_decay"] = args.weight_decay
+        history = load_history(args.output_dir)
+        if not history and "metrics" in checkpoint:
+            history = [checkpoint["metrics"]]
+        history = dedupe_history(history, resume_epoch=int(checkpoint["epoch"]))
+        best_test_mse = min((entry["test_mse"] for entry in history), default=float("inf"))
+        start_epoch = int(checkpoint["epoch"]) + 1
+        if is_main_process(rank):
+            print(
+                json.dumps(
+                    {
+                        "resume": str(args.resume),
+                        "resume_epoch": checkpoint["epoch"],
+                        "start_epoch": start_epoch,
+                        "best_test_mse_so_far": best_test_mse,
+                        "resume_lr": args.lr,
+                        "resume_weight_decay": args.weight_decay,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+
+    for epoch in range(start_epoch, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 

@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from deepcad_latent import DeepCADAdapter, ImageToCadPipeline
+from deepcad_latent.pipeline import _is_multimodal_state_dict
 from deepcad_latent.data import (
     ImageOnlyDataset,
     ImageTextOnlyDataset,
@@ -213,7 +214,7 @@ def sample_metrics(
 
         gt_param = gt[j, 1:]
         pred_param = pred[j, 1:]
-        tol_acc = (np.abs(pred_param - gt_param) < param_tol).astype(np.int64)
+        tol_acc = (np.abs(pred_param - gt_param) <= param_tol).astype(np.int64)
 
         # Align with DeepCAD official ACC_param evaluation.
         if gt_cmd == EXT_IDX:
@@ -237,6 +238,8 @@ def sample_metrics(
         "first_divergence_step": first_div,
         "bucket": length_bucket(int(len(gt))),
         "acc_cmd": float(cmd_correct_count / max(gt_len, 1)),
+        "cmd_correct_count": cmd_correct_count,
+        "cmd_total_count": gt_len,
         "param_correct_count": param_correct_count,
         "param_total_count": param_total_count,
         "acc_param": float(param_correct_count / param_total_count) if param_total_count > 0 else 1.0,
@@ -266,7 +269,7 @@ def aggregate(records: list[dict]) -> dict[str, object]:
         "mean_gt_len": mean("gt_len"),
         "mean_len_abs_error": mean("len_abs_error"),
         "first_divergence_missing_rate": float(sum(r["first_divergence_step"] == -1 for r in records) / total),
-        "acc_cmd": mean("acc_cmd"),
+        "acc_cmd": float(sum(int(r["cmd_correct_count"]) for r in records) / max(sum(int(r["cmd_total_count"]) for r in records), 1)),
         "acc_param": float(sum(int(r["param_correct_count"]) for r in records) / max(sum(int(r["param_total_count"]) for r in records), 1)),
     }
 
@@ -294,7 +297,10 @@ def aggregate(records: list[dict]) -> dict[str, object]:
             "token_exact_acc": float(sum(float(r["token_exact_acc"]) for r in bucket_records) / len(bucket_records)),
             "sequence_exact_rate": float(sum(float(r["sequence_exact"]) for r in bucket_records) / len(bucket_records)),
             "mean_len_abs_error": float(sum(float(r["len_abs_error"]) for r in bucket_records) / len(bucket_records)),
-            "acc_cmd": float(sum(float(r["acc_cmd"]) for r in bucket_records) / len(bucket_records)),
+            "acc_cmd": float(
+                sum(int(r["cmd_correct_count"]) for r in bucket_records)
+                / max(sum(int(r["cmd_total_count"]) for r in bucket_records), 1)
+            ),
             "acc_param": float(
                 sum(int(r["param_correct_count"]) for r in bucket_records)
                 / max(sum(int(r["param_total_count"]) for r in bucket_records), 1)
@@ -345,7 +351,7 @@ def main():
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     state_dict = checkpoint["model"]
-    is_multimodal = any(key.startswith("image_model.") or key.startswith("fusion.") for key in state_dict)
+    is_multimodal = _is_multimodal_state_dict(state_dict)
 
     if is_multimodal:
         if args.text_root is None:

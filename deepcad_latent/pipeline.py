@@ -9,6 +9,17 @@ from .model import MultiModalLatentRegressor, MultiViewLatentRegressor
 from .retrieval import LatentRetriever
 
 
+def _is_multimodal_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
+    if any(key.startswith("image_model.") for key in state_dict):
+        return True
+    multimodal_fusion_prefixes = (
+        "fusion.text_proj.",
+        "fusion.gate.",
+        "fusion.delta.",
+    )
+    return any(key.startswith(prefix) for key in state_dict for prefix in multimodal_fusion_prefixes)
+
+
 class ImageToCadPipeline:
     def __init__(
         self,
@@ -23,19 +34,32 @@ class ImageToCadPipeline:
         self.device = torch.device(device)
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         state_dict = checkpoint["model"]
-        self.is_multimodal = any(key.startswith("image_model.") or key.startswith("fusion.") for key in state_dict)
+        checkpoint_args = checkpoint.get("args", {})
+        self.is_multimodal = _is_multimodal_state_dict(state_dict)
+        fusion_type = checkpoint_args.get("fusion_type", "gru")
+        transformer_layers = int(checkpoint_args.get("transformer_layers", 2))
+        transformer_heads = int(checkpoint_args.get("transformer_heads", 8))
+        transformer_dropout = float(checkpoint_args.get("transformer_dropout", 0.1))
 
         if self.is_multimodal:
             self.model = MultiModalLatentRegressor(
                 backbone_name=backbone,
                 n_views=n_views,
                 freeze_backbone=freeze_backbone,
+                fusion_type=fusion_type,
+                transformer_layers=transformer_layers,
+                transformer_heads=transformer_heads,
+                transformer_dropout=transformer_dropout,
             ).to(self.device)
         else:
             self.model = MultiViewLatentRegressor(
                 backbone_name=backbone,
                 n_views=n_views,
                 freeze_backbone=freeze_backbone,
+                fusion_type=fusion_type,
+                transformer_layers=transformer_layers,
+                transformer_heads=transformer_heads,
+                transformer_dropout=transformer_dropout,
             ).to(self.device)
 
         self.model.load_state_dict(state_dict)
