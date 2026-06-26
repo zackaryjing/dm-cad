@@ -290,7 +290,7 @@ def build_demo(inspector: ImageToCadInspector):
             label="Input Views",
             columns=4,
             rows=2,
-            height=620,
+            height=380,
             object_fit="contain",
             preview=False,
         )

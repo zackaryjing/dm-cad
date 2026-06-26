@@ -45,33 +45,52 @@ def import_mesh(path: str):
     bpy.context.view_layer.objects.active = meshes[0]
     if len(meshes) > 1:
         bpy.ops.object.join()
-    return bpy.context.active_object
+    obj = bpy.context.active_object
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return obj
 
 
 def normalize_object(obj):
+    # Use the same normalization style as the dataset renderer.
     bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
     obj.location = (0.0, 0.0, 0.0)
-    bpy.context.view_layer.update()
-    bbox = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
-    min_v = Vector((min(v.x for v in bbox), min(v.y for v in bbox), min(v.z for v in bbox)))
-    max_v = Vector((max(v.x for v in bbox), max(v.y for v in bbox), max(v.z for v in bbox)))
-    center = (min_v + max_v) * 0.5
-    dims = max_v - min_v
-    max_dim = max(dims.x, dims.y, dims.z, 1e-6)
-    obj.location = -center
-    scale = 1.6 / max_dim
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    max_radius = max(Vector(v).length for v in obj.bound_box)
+    scale = 0.95 / max(max_radius, 1e-6)
     obj.scale = (scale, scale, scale)
-    bpy.context.view_layer.update()
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
 
 def setup_material(obj):
-    mat = bpy.data.materials.new(name="CadGray")
+    mat = bpy.data.materials.new(name="NormalZGray")
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
-    if bsdf is not None:
-        bsdf.inputs["Base Color"].default_value = (0.72, 0.72, 0.72, 1.0)
-        bsdf.inputs["Roughness"].default_value = 0.55
-        bsdf.inputs["Metallic"].default_value = 0.0
+    mat.blend_method = "OPAQUE"
+    mat.use_screen_refraction = False
+    mat.show_transparent_back = False
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    geom_node = nodes.new(type="ShaderNodeNewGeometry")
+    sep_node = nodes.new(type="ShaderNodeSeparateXYZ")
+    map_node = nodes.new(type="ShaderNodeMapRange")
+    bsdf_node = nodes.new(type="ShaderNodeBsdfDiffuse")
+    output_node = nodes.new(type="ShaderNodeOutputMaterial")
+
+    map_node.inputs["From Min"].default_value = -1.0
+    map_node.inputs["From Max"].default_value = 1.0
+    map_node.inputs["To Min"].default_value = 0.3
+    map_node.inputs["To Max"].default_value = 0.8
+    map_node.clamp = True
+
+    links.new(geom_node.outputs["Normal"], sep_node.inputs["Vector"])
+    links.new(sep_node.outputs["Z"], map_node.inputs["Value"])
+    links.new(map_node.outputs["Result"], bsdf_node.inputs["Color"])
+    links.new(bsdf_node.outputs["BSDF"], output_node.inputs["Surface"])
+
     obj.data.materials.clear()
     obj.data.materials.append(mat)
 
@@ -83,11 +102,36 @@ def setup_scene(size: int):
     scene.render.resolution_y = size
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "BW"
     scene.render.film_transparent = False
     scene.render.use_freestyle = True
-    scene.render.line_thickness = 1.2
+    scene.render.line_thickness = 1.0
+    scene.eevee.use_bloom = False
+    scene.eevee.use_ssr = False
+    scene.eevee.use_motion_blur = False
+    scene.eevee.use_gtao = False
+    linesets = bpy.context.view_layer.freestyle_settings.linesets
+    bpy.context.view_layer.freestyle_settings.crease_angle = math.radians(120)
+    if linesets:
+        lineset = linesets[0]
+        for attr, value in {
+            "select_silhouette": True,
+            "select_border": False,
+            "select_crease": True,
+            "select_edge_mark": False,
+            "select_material_boundary": False,
+            "select_suggestive_contour": False,
+            "select_ridge_valley": False,
+        }.items():
+            if hasattr(lineset, attr):
+                setattr(lineset, attr, value)
+        if hasattr(lineset, "visibility"):
+            lineset.visibility = "VISIBLE"
     scene.display_settings.display_device = "sRGB"
+    scene.view_settings.view_transform = "Standard"
     scene.view_settings.look = "None"
+    scene.view_settings.exposure = 0
+    scene.view_settings.gamma = 1
     world = bpy.data.worlds["World"]
     world.use_nodes = True
     bg = world.node_tree.nodes["Background"]
@@ -116,10 +160,12 @@ def setup_lights():
 
 def setup_camera():
     cam_data = bpy.data.cameras.new(name="Camera")
-    cam_data.lens = 48
+    cam_data.type = "ORTHO"
+    cam_data.ortho_scale = 2.0
     cam = bpy.data.objects.new("Camera", cam_data)
     bpy.context.collection.objects.link(cam)
-    cam.location = (2.8, -2.8, 2.1)
+    coord = Vector((1.0, -1.0, 1.0))
+    cam.location = coord.normalized() * 5.0
     target = bpy.data.objects.new("Target", None)
     target.location = (0.0, 0.0, 0.0)
     bpy.context.collection.objects.link(target)

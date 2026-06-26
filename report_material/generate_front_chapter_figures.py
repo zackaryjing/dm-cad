@@ -45,7 +45,16 @@ def add_box(ax, x, y, w, h, text, fc="#f5f7fb", ec="#4b5563", fontsize=11, weigh
     )
 
 
-def add_arrow(ax, start, end, color="#4b5563", style="-|>", lw=1.5, mutation_scale=14):
+def add_arrow(
+    ax,
+    start,
+    end,
+    color="#4b5563",
+    style="-|>",
+    lw=1.5,
+    mutation_scale=14,
+    connectionstyle="arc3",
+):
     arrow = FancyArrowPatch(
         start,
         end,
@@ -53,6 +62,7 @@ def add_arrow(ax, start, end, color="#4b5563", style="-|>", lw=1.5, mutation_sca
         mutation_scale=mutation_scale,
         linewidth=lw,
         color=color,
+        connectionstyle=connectionstyle,
     )
     ax.add_patch(arrow)
 
@@ -65,16 +75,16 @@ def finalize(ax):
 
 def fig_research_route() -> None:
     fig, ax = plt.subplots(figsize=(12, 3.8))
-    add_box(ax, 0.03, 0.3, 0.16, 0.38, "Omni-CAD\nJSON + Text", fc="#e8f1ff", ec="#2563eb", weight="bold")
-    add_box(ax, 0.23, 0.3, 0.18, 0.38, "DeepCAD-compatible\nCAD sequence / latent\nrepresentation", fc="#f3e8ff", ec="#7c3aed")
-    add_box(ax, 0.45, 0.3, 0.16, 0.38, "Image-only baseline\nResNet18 + GRU", fc="#fff7ed", ec="#ea580c")
-    add_box(ax, 0.65, 0.3, 0.16, 0.38, "Multimodal extension\nText residual fusion", fc="#ecfdf5", ec="#059669")
-    add_box(ax, 0.84, 0.3, 0.13, 0.38, "Transformer\nfront-end +\nanalysis", fc="#eef2ff", ec="#4338ca")
+    add_box(ax, 0.03, 0.3, 0.15, 0.38, "Omni-CAD\nJSON + Text", fc="#e8f1ff", ec="#2563eb", weight="bold")
+    add_box(ax, 0.24, 0.3, 0.17, 0.38, "DeepCAD-compatible\nCAD sequence / latent\nrepresentation", fc="#f3e8ff", ec="#7c3aed")
+    add_box(ax, 0.47, 0.3, 0.15, 0.38, "Image-only baseline\nResNet18 + GRU", fc="#fff7ed", ec="#ea580c")
+    add_box(ax, 0.68, 0.3, 0.15, 0.38, "Multimodal extension\nText residual fusion", fc="#ecfdf5", ec="#059669")
+    add_box(ax, 0.89, 0.3, 0.09, 0.38, "Transformer\nfront-end +\nanalysis", fc="#eef2ff", ec="#4338ca")
 
-    add_arrow(ax, (0.19, 0.49), (0.23, 0.49), color="#2563eb")
-    add_arrow(ax, (0.41, 0.49), (0.45, 0.49), color="#7c3aed")
-    add_arrow(ax, (0.61, 0.49), (0.65, 0.49), color="#ea580c")
-    add_arrow(ax, (0.81, 0.49), (0.84, 0.49), color="#059669")
+    add_arrow(ax, (0.18, 0.49), (0.24, 0.49), color="#2563eb")
+    add_arrow(ax, (0.41, 0.49), (0.47, 0.49), color="#7c3aed")
+    add_arrow(ax, (0.62, 0.49), (0.68, 0.49), color="#ea580c")
+    add_arrow(ax, (0.83, 0.49), (0.89, 0.49), color="#059669")
 
     ax.text(0.5, 0.82, "Research Route of This Thesis", ha="center", va="center", fontsize=15, weight="bold")
     ax.text(
@@ -110,7 +120,10 @@ def fig_dataset_pipeline() -> None:
 
     add_arrow(ax, (0.20, 0.67), (0.27, 0.74), color="#2563eb")
     add_arrow(ax, (0.20, 0.67), (0.27, 0.52), color="#2563eb")
-    add_arrow(ax, (0.20, 0.27), (0.77, 0.52), color="#059669")
+    add_arrow(ax, (0.20, 0.27), (0.50, 0.27), color="#059669")
+    add_arrow(ax, (0.50, 0.27), (0.50, 0.12), color="#059669", style="-", mutation_scale=1)
+    add_arrow(ax, (0.50, 0.12), (0.86, 0.12), color="#059669", style="-", mutation_scale=1)
+    add_arrow(ax, (0.86, 0.12), (0.86, 0.44), color="#059669")
     add_arrow(ax, (0.20, 0.67), (0.27, 0.28), color="#2563eb")
     add_arrow(ax, (0.45, 0.74), (0.54, 0.74), color="#7c3aed")
     add_arrow(ax, (0.45, 0.52), (0.54, 0.51), color="#ea580c")

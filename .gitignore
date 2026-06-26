@@ -3,3 +3,18 @@ datasets/*
 *.zip
 .vscode
 runs
+
+# Generated render/review artifacts
+_renders/
+
+# Packaged deliverables, model weights, attachments, and shard exports
+deliverables/
+
+# Report/thesis intermediate outputs
+report_material/data/
+report_material/figures/imagegen_candidates/
+report_material/figures/ppt/
+report_material/figures/qualitative/
+report_material/figures/qualitative_candidates/
+report_material/figures/qualitative_dataset_style/
+report_material/figures/text_gain_candidates/

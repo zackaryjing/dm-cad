@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -112,18 +113,20 @@ def load_text_caption(sample_id: str) -> str:
     return ""
 
 
-def export_stl(cad_vec: np.ndarray, path: Path) -> bool:
+def export_stl(cad_vec: np.ndarray, path: Path) -> tuple[bool, str]:
     try:
         shape = vec2CADsolid(cad_vec.astype(np.float64))
         path.parent.mkdir(parents=True, exist_ok=True)
         write_stl_file(shape, str(path))
-        return True
-    except Exception:
-        return False
+        if not path.exists() or path.stat().st_size == 0:
+            return False, "export_empty_stl"
+        return True, "ok"
+    except Exception as exc:
+        return False, f"export_failed:{type(exc).__name__}:{exc}"
 
 
-def render_preview(mesh_path: Path, output_path: Path, size: int) -> bool:
-    cmd = [
+def render_preview(mesh_path: Path, output_path: Path, size: int) -> tuple[bool, str]:
+    blender_cmd = [
         "blender",
         "-b",
         "-P",
@@ -136,8 +139,102 @@ def render_preview(mesh_path: Path, output_path: Path, size: int) -> bool:
         "--size",
         str(size),
     ]
+    xvfb = shutil.which("xvfb-run")
+    cmd = ["xvfb-run", "-a", *blender_cmd] if xvfb else blender_cmd
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return proc.returncode == 0 and output_path.exists()
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        tail = detail[-1] if detail else "no blender output"
+        ok, fallback_status = render_preview_software(mesh_path, output_path, size)
+        if ok:
+            return True, "ok"
+        return False, f"blender_failed:{proc.returncode}:{tail}; fallback:{fallback_status}"
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        ok, fallback_status = render_preview_software(mesh_path, output_path, size)
+        if ok:
+            return True, "ok"
+        return False, f"blender_no_output; fallback:{fallback_status}"
+    return True, "ok"
+
+
+def render_preview_software(mesh_path: Path, output_path: Path, size: int) -> tuple[bool, str]:
+    """Small software fallback for headless environments without GLX/EGL."""
+    try:
+        import trimesh
+
+        mesh = trimesh.load_mesh(str(mesh_path), force="mesh")
+        if mesh.is_empty or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            return False, "software_empty_mesh"
+
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        center = (vertices.min(axis=0) + vertices.max(axis=0)) * 0.5
+        vertices = vertices - center
+        scale = np.max(np.ptp(vertices, axis=0))
+        if not np.isfinite(scale) or scale <= 1e-9:
+            return False, "software_bad_scale"
+        vertices = vertices / scale
+
+        yaw = math.radians(-38)
+        pitch = math.radians(26)
+        rz = np.array(
+            [
+                [math.cos(yaw), -math.sin(yaw), 0.0],
+                [math.sin(yaw), math.cos(yaw), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        rx = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, math.cos(pitch), -math.sin(pitch)],
+                [0.0, math.sin(pitch), math.cos(pitch)],
+            ]
+        )
+        projected = vertices @ rz.T @ rx.T
+        xy = projected[:, :2]
+        xy[:, 1] *= -1.0
+        xy = xy * (size * 0.62) + size * 0.5
+
+        face_vertices = projected[faces]
+        normals = np.cross(face_vertices[:, 1] - face_vertices[:, 0], face_vertices[:, 2] - face_vertices[:, 0])
+        norm = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = np.divide(normals, np.maximum(norm, 1e-9))
+        light = np.array([0.25, -0.35, 0.9])
+        light = light / np.linalg.norm(light)
+        intensity = np.clip(normals @ light, 0.0, 1.0)
+        depth = face_vertices[:, :, 2].mean(axis=1)
+
+        img = Image.new("RGB", (size, size), (232, 232, 232))
+        draw = ImageDraw.Draw(img)
+        for face_idx in np.argsort(depth):
+            poly = [tuple(pt) for pt in xy[faces[face_idx]]]
+            gray = int(178 + 58 * float(intensity[face_idx]))
+            draw.polygon(poly, fill=(gray, gray, gray))
+
+        # Draw only real mesh boundary / crease edges, not every triangulation edge.
+        edge_to_faces: dict[tuple[int, int], list[int]] = {}
+        for face_idx, face in enumerate(faces):
+            for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+                edge = (int(min(a, b)), int(max(a, b)))
+                edge_to_faces.setdefault(edge, []).append(face_idx)
+
+        crease_cos = math.cos(math.radians(24))
+        for edge, adjacent in edge_to_faces.items():
+            should_draw = len(adjacent) == 1
+            if len(adjacent) == 2:
+                n0, n1 = normals[adjacent[0]], normals[adjacent[1]]
+                should_draw = float(np.dot(n0, n1)) < crease_cos
+            if not should_draw:
+                continue
+            p0, p1 = xy[list(edge)]
+            draw.line((tuple(p0), tuple(p1)), fill=(36, 36, 36), width=max(1, size // 180))
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(output_path)
+        return True, "ok"
+    except Exception as exc:
+        return False, f"software_failed:{type(exc).__name__}:{exc}"
 
 
 def stitch_multiview(sample_id: str) -> Image.Image:
@@ -309,11 +406,18 @@ def make_panel(rows: list[dict], mode: str, render_size: int) -> Image.Image:
             variants = {"image": item["cad_trans"], "text": item["cad_text"], "gt": item["gt"]}
 
         order = list(variants.keys())
+        render_statuses = {}
         for key in order:
             stl_path = sample_dir / f"{key}.stl"
             png_path = sample_dir / f"{key}.png"
-            if export_stl(variants[key], stl_path):
-                render_preview(stl_path, png_path, render_size)
+            stl_path.unlink(missing_ok=True)
+            png_path.unlink(missing_ok=True)
+            ok, status = export_stl(variants[key], stl_path)
+            if ok:
+                ok, status = render_preview(stl_path, png_path, render_size)
+            render_statuses[key] = status
+            if status != "ok":
+                print(f"{sid} {key} render status: {status}", file=sys.stderr, flush=True)
             paths[key] = png_path
 
         keys_for_cols = ["gru", "transformer", "gt"] if mode == "frontend" else ["image", "text", "gt"]
@@ -324,7 +428,9 @@ def make_panel(rows: list[dict], mode: str, render_size: int) -> Image.Image:
                 png = Image.new("RGB", (render_size, render_size), "white")
                 fail_draw = ImageDraw.Draw(png)
                 fail_draw.rectangle((1, 1, render_size - 2, render_size - 2), outline="black", width=2)
-                fail_draw.text((18, render_size // 2 - 12), "Render failed", fill="black", font=font_label)
+                status = render_statuses.get(key, "render_failed")
+                fail_draw.text((18, render_size // 2 - 22), "Render failed", fill="black", font=font_label)
+                fail_draw.text((18, render_size // 2 + 8), status[:28], fill="black", font=font_text)
             canvas.paste(png, (x_positions[col_idx + 1], top + 24))
 
         caption = item["caption"].strip() or "(no caption)"
