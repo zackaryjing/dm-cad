@@ -25,15 +25,15 @@ training:
 loss:
   cmd_weight: 1.0
   eos_weight: 0.6
-  param_weight: 0.35
+  param_weight: 1.0
   use_cmd_mask: true
   eos_token_id: 3
   label_smoothing: 0.05
   class_weights: [1.0, 1.1, 1.0, 1.6, 1.3, 1.15]
   param_scale: 128.0
-  param_huber_delta: 0.02
-  param_curriculum_start: 0.15
-  param_curriculum_end: 0.65
+  param_huber_delta: 0.25
+  param_curriculum_start: 0.1876
+  param_curriculum_end: 1.0
   param_loss_cap: 1.0
 
 optimizer:
@@ -66,6 +66,6 @@ log:
 
 device:
   type: cuda
-  visible_devices: [5,6]
+  visible_devices: [0,1]
   use_data_parallel: true
   output_device: 0

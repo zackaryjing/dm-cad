@@ -83,8 +83,8 @@ python train_main.py --config train/config.yaml --resume runs/dmcad/<run_name>/c
 - `training.precision`: 训练精度模式，支持 `fp32` / `fp16` / `bf16`
 - `optimizer.lr`: 优化器基础学习率；当前训练代码只读取这里的学习率配置
 - `optimizer.weight_decay`: 优化器权重衰减；当前训练代码只读取这里的权重衰减配置
-- `loss.param_scale`: 参数损失归一化尺度。当前参数值量级较大时，应设置到与数据尺度接近的值，避免 `tanh(param / param_scale)` 过早饱和
-- `loss.param_huber_delta`: 归一化参数空间中的 Huber 阈值。若 `param_scale=128` 且 `param_huber_delta=0.02`，则二次区间大约对应原始误差 `2.56`
+- `loss.param_scale`: 参数损失归一化尺度。当前参数值量级较大时，应设置到与数据尺度接近的值，避免归一化后的参数误差尺度失真
+- `loss.param_huber_delta`: 归一化参数空间中的 Huber 阈值。若 `param_scale=128` 且 `param_huber_delta=0.25`，则二次区间大约对应原始误差 `32`
 - `data.backend`: 数据后端，`files` 表示散文件读取，`lmdb` 表示从 LMDB 读取，默认 `files`
 - `data.lmdb_path`: LMDB 路径；相对路径相对于 `data_root`
 - `data.pin_memory`: 是否启用 DataLoader pin memory，默认 `true`
